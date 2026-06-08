@@ -220,6 +220,43 @@ void VulkanGSPipeline::resizeDeviceBuffer(_VulkanBuffer& deviceBuffer, size_t ne
     deviceBuffer.size = new_byte_size;
 }
 
+void VulkanGSPipeline::uploadHostBufferToDevice(_VulkanBuffer& dst, const void* src, size_t bytes) {
+    if (bytes == 0)
+        return;
+    if (src == nullptr)
+        _THROW_ERROR("uploadHostBufferToDevice received a null source pointer");
+    if (dst.buffer == VK_NULL_HANDLE)
+        _THROW_ERROR("uploadHostBufferToDevice destination buffer is not allocated");
+    if (dst.size < bytes)
+        _THROW_ERROR("uploadHostBufferToDevice destination is smaller than the upload size");
+
+    allocStagingBuffer(bytes);
+
+    // Fill the host-visible staging buffer. No command batch is active here (callers
+    // run this before recording the frame), so a plain map/memcpy/flush is safe.
+    {
+        void* base = nullptr;
+        if (vmaMapMemory(allocator, stager.allocation, &base) != VK_SUCCESS)
+            _THROW_ERROR("uploadHostBufferToDevice failed to map the staging buffer");
+        memcpy(base, src, bytes);
+        vmaFlushAllocation(allocator, stager.allocation, 0, bytes);
+        vmaUnmapMemory(allocator, stager.allocation);
+    }
+
+    // Record staging -> device copy in its own batch (fence on scope exit) and make
+    // the bytes visible to subsequent compute reads. A self-contained batch keeps the
+    // single shared staging buffer reusable across consecutive uploads.
+    {
+        DEVICE_GUARD;
+        VkBufferCopy region{};
+        region.srcOffset = 0;
+        region.dstOffset = dst.offset;
+        region.size = bytes;
+        vkCmdCopyBuffer(command_buffer, stager.buffer, dst.buffer, 1, &region);
+        bufferMemoryBarrier({{dst, TRANSFER_WRITE}}, COMPUTE_SHADER_READ);
+    }
+}
+
 template <typename T>
 _VulkanBuffer& VulkanGSPipeline::resizeDeviceBuffer(Buffer<T>& buffer, size_t new_size, bool no_shrink) {
     auto& deviceBuffer = buffer.deviceBuffer;

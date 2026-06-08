@@ -59,3 +59,4 @@ plugInfo.json
 # only creates merge-conflict churn).
 src/rendering/rasterizer/vulkan/shader/generated/*.spv
 src/rendering/rasterizer/vulkan/shader/radix_sort/*.spv
+docs/macos-port-plan.md

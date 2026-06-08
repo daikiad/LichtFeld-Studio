@@ -161,6 +161,13 @@ namespace lfs::vis {
             bool force_upload,
             int upload_sh_degree,
             bool synchronize_upload = false);
+        // No-interop (macOS) input path: copy the raw split SplatData tensors into
+        // owned device buffers via staging instead of importing CUDA-external tensors.
+        // Always uploads at the model's full SH degree for a stable swizzled layout.
+        [[nodiscard]] std::expected<InputBindingResult, std::string> prepareInputsHostCopy(
+            const lfs::core::SplatData& splat_data,
+            std::size_t ring_slot,
+            bool force_upload);
         struct OverlayBindingViews {
             _VulkanBuffer selection_mask{};
             _VulkanBuffer preview_mask{};
@@ -176,6 +183,13 @@ namespace lfs::vis {
             const lfs::rendering::ViewportRenderRequest& request,
             std::size_t num_splats,
             std::size_t ring_slot);
+        // No-interop (macOS) overlay bindings: one owned device buffer holding a
+        // disabled overlay-params table + zeroed mask/color/transform regions, so the
+        // forward/raster shaders get valid (non-NULL) bindings without selection
+        // overlays. raster_overlays_active=false selects the cheap _plain raster path.
+        [[nodiscard]] std::expected<OverlayBindingViews, std::string> makeEmptyOverlayBindings(
+            const lfs::rendering::ViewportRenderRequest& request,
+            std::size_t num_splats);
         [[nodiscard]] bool inputsResident(const lfs::core::SplatData& splat_data,
                                           std::size_t ring_slot) const;
         [[nodiscard]] std::expected<void, std::string> ensureOutputImages(
@@ -357,6 +371,14 @@ namespace lfs::vis {
         CudaSelectionQuerySlot cuda_selection_query_{};
         std::array<ModelInputSnapshot, kInputRingSize> ring_uploaded_{};
         int current_input_sh_degree_ = -1;
+
+        // No-interop (macOS) overlay-binding scratch: a single owned device buffer
+        // holding a disabled overlay-params table + zeroed mask/color/transform
+        // regions, reused across frames. Re-uploaded only when the layout or the
+        // params bytes change. Freed in reset().
+        _VulkanBuffer empty_overlay_buffer_{};
+        std::size_t empty_overlay_total_bytes_ = 0;
+        std::vector<float> empty_overlay_params_cache_;
         std::size_t last_vram_report_signature_ = 0;
 
         struct SharedScratchArena {

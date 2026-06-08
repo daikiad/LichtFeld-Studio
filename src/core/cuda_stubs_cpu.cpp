@@ -16,8 +16,10 @@
 #include "core/tensor.hpp"
 
 #include <expected>
+#include <functional>
 #include <memory>
 #include <optional>
+#include <vector>
 
 // lfs_core is built with hidden default visibility and these CUDA entry points are
 // not tagged LFS_CORE_API, so the (gated) .cu would normally provide them. The
@@ -28,12 +30,38 @@
 namespace lfs::core {
 
     // ---- RasterizerMemoryArena (CUDA VMM arena; inert without CUDA) -----------
+    // The arena exists only to back the CUDA<->Vulkan zero-copy rasterizer scratch.
+    // Without CUDA it never holds storage, so every method is a no-op / empty default.
+    // These must all be defined: with -undefined dynamic_lookup an *undefined* method
+    // binds to 0x0 and crashes when called (e.g. Scene::clear -> full_reset()).
     RasterizerMemoryArena::RasterizerMemoryArena() {}
     RasterizerMemoryArena::RasterizerMemoryArena(const Config&) {}
     RasterizerMemoryArena::~RasterizerMemoryArena() {}
+    RasterizerMemoryArena::RasterizerMemoryArena(RasterizerMemoryArena&&) noexcept {}
+    RasterizerMemoryArena& RasterizerMemoryArena::operator=(RasterizerMemoryArena&&) noexcept { return *this; }
 
+    uint64_t RasterizerMemoryArena::begin_frame(bool) { return 0; }
     std::optional<uint64_t> RasterizerMemoryArena::try_begin_frame(bool) { return std::nullopt; }
     void RasterizerMemoryArena::end_frame(uint64_t, bool) {}
+    std::function<char*(size_t)> RasterizerMemoryArena::get_allocator(uint64_t) {
+        return [](size_t) -> char* { return nullptr; };
+    }
+    std::vector<RasterizerMemoryArena::BufferHandle> RasterizerMemoryArena::get_frame_buffers(uint64_t) const { return {}; }
+    void RasterizerMemoryArena::reset_frame(uint64_t) {}
+    void RasterizerMemoryArena::cleanup_frames(int) {}
+    void RasterizerMemoryArena::full_reset() {}
+    bool RasterizerMemoryArena::install_external_backing(ExternalBacking) { return false; }
+    bool RasterizerMemoryArena::try_install_external_backing(ExternalBacking) { return false; }
+    bool RasterizerMemoryArena::grow_external_backing(const void*, size_t, const std::function<bool(size_t)>&) { return false; }
+    void RasterizerMemoryArena::clear_external_backing(const void*) {}
+    bool RasterizerMemoryArena::using_external_backing() const { return false; }
+    RasterizerMemoryArena::Statistics RasterizerMemoryArena::get_statistics() const { return {}; }
+    RasterizerMemoryArena::MemoryInfo RasterizerMemoryArena::get_memory_info() const { return {}; }
+    void RasterizerMemoryArena::dump_statistics() const {}
+    void RasterizerMemoryArena::log_memory_status(uint64_t, bool) {}
+    bool RasterizerMemoryArena::is_under_memory_pressure() const { return false; }
+    float RasterizerMemoryArena::get_memory_pressure() const { return 0.0f; }
+    bool RasterizerMemoryArena::is_rendering_active() const { return false; }
     void RasterizerMemoryArena::set_rendering_active(bool) {}
 
     // ---- GlobalArenaManager --------------------------------------------------
@@ -46,9 +74,12 @@ namespace lfs::core {
             arena_ = std::make_unique<RasterizerMemoryArena>();
         return *arena_;
     }
+    RasterizerMemoryArena* GlobalArenaManager::try_get_arena() { return arena_.get(); }
+    bool GlobalArenaManager::install_external_backing(RasterizerMemoryArena::ExternalBacking) { return false; }
+    bool GlobalArenaManager::try_install_external_backing(RasterizerMemoryArena::ExternalBacking) { return false; }
     bool GlobalArenaManager::grow_external_backing(const void*, size_t, const std::function<bool(size_t)>&) { return false; }
     void GlobalArenaManager::clear_external_backing(const void*) {}
-    bool GlobalArenaManager::try_install_external_backing(RasterizerMemoryArena::ExternalBacking) { return false; }
+    void GlobalArenaManager::reset() { arena_.reset(); }
 
     // ---- Exportable device blocks (CUDA VMM) ---------------------------------
     std::expected<std::shared_ptr<ExportableBlock>, std::string>

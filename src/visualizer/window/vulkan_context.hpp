@@ -169,6 +169,16 @@ namespace lfs::vis {
                                                ExternalImage& out,
                                                std::string_view diagnostic_scope = "vulkan.external.image",
                                                std::string_view diagnostic_label = {});
+        // Non-exportable twin of createExternalImage for platforms without CUDA/Vulkan
+        // external-memory interop (e.g. MoltenVK, where opaque-FD image export is
+        // unsupported). Produces the same ExternalImage (sampled/storage/transfer
+        // usage, device-local memory) minus the export chain; native_handle stays
+        // invalid. Freed by the same destroyExternalImage().
+        [[nodiscard]] bool createSampledImage(VkExtent2D extent,
+                                              VkFormat format,
+                                              ExternalImage& out,
+                                              std::string_view diagnostic_scope = "vulkan.sampled.image",
+                                              std::string_view diagnostic_label = {});
         void destroyExternalImage(ExternalImage& image);
         [[nodiscard]] ExternalNativeHandle releaseExternalImageNativeHandle(ExternalImage& image) const;
         [[nodiscard]] bool createExternalBuffer(VkDeviceSize size,

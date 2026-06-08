@@ -46,6 +46,11 @@ public:
 
     void createBuffer(size_t size, _VulkanBuffer& buffer);
     void destroyBuffer(_VulkanBuffer& buffer);
+    // Copy `bytes` from host memory into an already-allocated device buffer via the
+    // shared staging buffer (memcpy -> vkCmdCopyBuffer -> TRANSFER_WRITE→COMPUTE
+    // barrier). Self-contained: records and submits its own command batch and waits.
+    // Used by the macOS/no-interop input path to feed splat inputs without CUDA.
+    void uploadHostBufferToDevice(_VulkanBuffer& dst, const void* src, size_t bytes);
     void resizeDeviceBuffer(_VulkanBuffer& deviceBuffer, size_t new_byte_size, bool no_shrink = true);
     template <typename T>
     _VulkanBuffer& resizeDeviceBuffer(Buffer<T>& buffer, size_t new_size, bool no_shrink = true);

@@ -414,6 +414,47 @@ namespace lfs::vis {
             return view;
         }
 
+        // Stage a tensor as a contiguous CPU float32 vector (no CUDA). On macOS the
+        // raw SplatData tensors are already CPU/contiguous/float32, so this is a copy;
+        // the conversions are kept for safety. Mirrors vksplat_input_packer's helper.
+        [[nodiscard]] std::expected<std::vector<float>, std::string> hostFloatVector(
+            lfs::core::Tensor tensor,
+            const std::string_view label) {
+            using lfs::core::DataType;
+            using lfs::core::Device;
+            using lfs::core::Tensor;
+            if (!tensor.is_valid() || tensor.numel() == 0) {
+                return std::vector<float>{};
+            }
+            try {
+                const Tensor* current = &tensor;
+                Tensor float_tensor;
+                if (current->dtype() != DataType::Float32) {
+                    float_tensor = current->to(DataType::Float32);
+                    current = &float_tensor;
+                }
+                Tensor cpu_tensor;
+                if (current->device() != Device::CPU) {
+                    cpu_tensor = current->to(Device::CPU);
+                    current = &cpu_tensor;
+                }
+                Tensor contiguous_tensor;
+                if (!current->is_contiguous()) {
+                    contiguous_tensor = current->contiguous();
+                    current = &contiguous_tensor;
+                }
+                const float* ptr = current->ptr<float>();
+                if (!ptr) {
+                    return std::unexpected(std::format("VkSplat got a null CPU pointer for {}", label));
+                }
+                std::vector<float> result(static_cast<std::size_t>(current->numel()));
+                std::memcpy(result.data(), ptr, result.size() * sizeof(float));
+                return result;
+            } catch (const std::exception& e) {
+                return std::unexpected(std::format("VkSplat failed to stage {}: {}", label, e.what()));
+            }
+        }
+
         [[nodiscard]] _VulkanBuffer makeResizableRegionView(const VulkanContext::ExternalBuffer& buffer,
                                                             const std::size_t offset,
                                                             const std::size_t capacity_bytes) {
@@ -1243,6 +1284,14 @@ namespace lfs::vis {
         // under us.
         if (initialized_) {
             detachManagedBuffers();
+            // Owned no-interop overlay scratch is not part of buffers_; free it before
+            // the pipeline tears down its allocator.
+            if (empty_overlay_buffer_.buffer != VK_NULL_HANDLE) {
+                renderer_.destroyBuffer(empty_overlay_buffer_);
+            }
+            empty_overlay_buffer_ = {};
+            empty_overlay_total_bytes_ = 0;
+            empty_overlay_params_cache_.clear();
             renderer_.cleanupBuffers(buffers_);
             renderer_.cleanup();
         }
@@ -2014,7 +2063,11 @@ namespace lfs::vis {
             return std::unexpected("VkSplat overlay bindings cannot bind an empty model");
         }
         if (!context.externalMemoryInteropEnabled()) {
-            return std::unexpected("VkSplat overlay bindings require CUDA/Vulkan external-memory interop");
+            // No CUDA/Vulkan interop (macOS): bind a disabled overlay-params table and
+            // zeroed mask/color regions from an owned device buffer. Selection/preview
+            // overlays are unavailable (out of scope for the display path).
+            (void)ring_slot;
+            return makeEmptyOverlayBindings(request, num_splats);
         }
         assert(ring_slot < cuda_overlays_.size());
         // Keep overlay uploads on the current stream. Selection/preview masks
@@ -2452,6 +2505,12 @@ namespace lfs::vis {
             return std::unexpected(std::format("VkSplat initialization failed: {}", e.what()));
         }
 
+        // The CUDA-imported upload/overlay/selection timeline semaphores below exist
+        // only for the interop upload handshake (CUDA signals after cudaMemcpyAsync,
+        // Vulkan compute waits). The macOS host-copy path uploads with the rasterizer's
+        // own fence and never signals these, and the export they need is unsupported on
+        // MoltenVK — so skip creating them entirely when interop is off.
+        if (context.externalMemoryInteropEnabled()) {
         // Per-ring-slot upload timeline: a Vulkan-exportable timeline semaphore
         // imported into CUDA so we can signal CUDA-side after the upload's
         // cudaMemcpyAsync and have Vulkan compute wait on it, replacing the
@@ -2525,6 +2584,7 @@ namespace lfs::vis {
             }
             timeline.value = 0;
         }
+        } // interop-only timeline semaphores
 
         initialized_ = true;
         return {};
@@ -2618,7 +2678,10 @@ namespace lfs::vis {
         }
 
         if (!context.externalMemoryInteropEnabled()) {
-            return std::unexpected("VkSplat input binding requires CUDA/Vulkan external-memory interop");
+            // No CUDA/Vulkan interop (macOS): feed the rasterizer by copying the raw
+            // split tensors into owned device buffers via staging instead of importing
+            // CUDA-external storage.
+            return prepareInputsHostCopy(splat_data, ring_slot, force_upload);
         }
         assert(ring_slot < cuda_inputs_.size());
         auto& slot = cuda_inputs_[ring_slot];
@@ -2895,6 +2958,157 @@ namespace lfs::vis {
             input_copy_reason));
     }
 
+    std::expected<VksplatViewportRenderer::InputBindingResult, std::string>
+    VksplatViewportRenderer::prepareInputsHostCopy(
+        const lfs::core::SplatData& splat_data,
+        const std::size_t ring_slot,
+        const bool force_upload) {
+        const std::size_t n = static_cast<std::size_t>(splat_data.size());
+        if (n == 0) {
+            return std::unexpected("VkSplat cannot render an empty model");
+        }
+
+        // Always upload at the model's full SH degree so the swizzled shN layout is
+        // stable and current_input_sh_degree_ matches what the shader reads.
+        const int upload_degree = splat_data.get_max_sh_degree();
+        auto layout = vksplat::rawDeviceInputLayout(splat_data, upload_degree);
+        if (!layout) {
+            return std::unexpected(layout.error());
+        }
+
+        const bool snapshot_changed = !inputsResident(splat_data, ring_slot);
+        const bool need_upload = force_upload || snapshot_changed;
+
+        // (Re)size an owned device buffer and, when needed, copy the raw tensor in.
+        const auto stage_buffer =
+            [&](Buffer<float>& dst, const lfs::core::Tensor& tensor, const std::size_t bytes,
+                const char* const label) -> std::expected<void, std::string> {
+            renderer_.resizeDeviceBuffer(dst, bytes / sizeof(float));
+            if (!need_upload) {
+                return {};
+            }
+            auto host = hostFloatVector(tensor, label);
+            if (!host) {
+                return std::unexpected(host.error());
+            }
+            if (host->size() * sizeof(float) < bytes) {
+                return std::unexpected(std::format(
+                    "VkSplat staged {} smaller than required: have {} bytes, need {}",
+                    label, host->size() * sizeof(float), bytes));
+            }
+            renderer_.uploadHostBufferToDevice(dst.deviceBuffer, host->data(), bytes);
+            return {};
+        };
+
+        if (auto ok = stage_buffer(buffers_.xyz_ws, splat_data.means_raw(), layout->xyz_bytes, "means"); !ok)
+            return std::unexpected(ok.error());
+        if (auto ok = stage_buffer(buffers_.sh0, splat_data.sh0_raw(), layout->sh0_bytes, "sh0"); !ok)
+            return std::unexpected(ok.error());
+        if (auto ok = stage_buffer(buffers_.rotations, splat_data.rotation_raw(), layout->rotations_bytes, "rotation"); !ok)
+            return std::unexpected(ok.error());
+        if (auto ok = stage_buffer(buffers_.scaling_raw, splat_data.scaling_raw(), layout->scaling_bytes, "scaling"); !ok)
+            return std::unexpected(ok.error());
+        if (auto ok = stage_buffer(buffers_.opacity_raw, splat_data.opacity_raw(), layout->opacity_bytes, "opacity"); !ok)
+            return std::unexpected(ok.error());
+
+        // shN: the swizzled 1D tensor is uploaded as-is. When the model has no rest
+        // coefficients the shader never reads shN, but it still needs a valid binding.
+        if (layout->omits_shN) {
+            renderer_.resizeDeviceBuffer(buffers_.shN, layout->shN_bytes / sizeof(float));
+        } else {
+            if (auto ok = stage_buffer(buffers_.shN, splat_data.shN_raw(), layout->shN_bytes, "shN"); !ok)
+                return std::unexpected(ok.error());
+        }
+
+        // Legacy packed inputs are unused on this path.
+        buffers_.scales_opacs.deviceBuffer = {};
+        buffers_.sh_coeffs.deviceBuffer = {};
+
+        buffers_.num_splats = n;
+        if (snapshot_changed) {
+            buffers_.num_indices = 0;
+            buffers_.is_unsorted_1 = true;
+        }
+        if (need_upload) {
+            ring_uploaded_[ring_slot] = makeModelInputSnapshot(splat_data);
+        }
+        current_input_sh_degree_ = upload_degree;
+        return InputBindingResult{.uses_temporary_upload_slot = false};
+    }
+
+    std::expected<VksplatViewportRenderer::OverlayBindingViews, std::string>
+    VksplatViewportRenderer::makeEmptyOverlayBindings(
+        const lfs::rendering::ViewportRenderRequest& request,
+        const std::size_t num_splats) {
+        if (num_splats == 0) {
+            return std::unexpected("VkSplat overlay bindings cannot bind an empty model");
+        }
+
+        // All overlay features disabled: the per-gaussian mask/index regions collapse
+        // to a few bytes (never read with overlays inactive and model-transform step
+        // 0). overlay_params still carries a real (mostly-zero = disabled) filter table
+        // that the projection/raster shaders read every frame.
+        const std::size_t model_count = modelTransformCount(request.scene.model_transforms);
+        std::array<std::size_t, kOverlayRegionCount> region_bytes{};
+        region_bytes[OverlaySelectionMask] = alignUp(1, 4);
+        region_bytes[OverlayPreviewMask] = alignUp(1, 4);
+        region_bytes[OverlaySelectionColors] = lfs::rendering::kSelectionColorTableCount * 4 * sizeof(float);
+        region_bytes[OverlayTransformIndices] = sizeof(std::int32_t);
+        region_bytes[OverlayNodeMask] = alignUp(1, 4);
+        region_bytes[OverlayParams] = static_cast<std::size_t>(ParamCount) * 4 * sizeof(float);
+        region_bytes[OverlayModelTransforms] = std::max<std::size_t>(model_count, 1) * 16 * sizeof(float);
+
+        std::array<std::size_t, kOverlayRegionCount> region_offset{};
+        const std::size_t total_bytes = layoutRegions(region_bytes, region_offset, kRegionAlignment);
+
+        // (Re)allocate + zero the owned buffer only when the layout changes.
+        const bool reallocated = empty_overlay_buffer_.buffer == VK_NULL_HANDLE ||
+                                 empty_overlay_total_bytes_ != total_bytes;
+        if (reallocated) {
+            renderer_.resizeDeviceBuffer(empty_overlay_buffer_, total_bytes, /*no_shrink=*/false);
+            const std::vector<float> zeros(total_bytes / sizeof(float), 0.0f);
+            renderer_.uploadHostBufferToDevice(empty_overlay_buffer_, zeros.data(), total_bytes);
+            empty_overlay_total_bytes_ = total_bytes;
+            empty_overlay_params_cache_.clear();
+        }
+
+        // Disabled overlay-params table (filters still honored if the request has them).
+        auto params = buildOverlayParamsCpuFloats(request,
+                                                  /*selection_enabled=*/false,
+                                                  /*preview_enabled=*/false,
+                                                  /*transform_indices_enabled=*/false,
+                                                  /*node_mask_count=*/0,
+                                                  /*node_visibility_cull=*/false);
+        if (!params) {
+            return std::unexpected(params.error());
+        }
+        if (*params != empty_overlay_params_cache_) {
+            auto params_view = makeBorrowedBufferView(empty_overlay_buffer_.buffer,
+                                                      empty_overlay_buffer_.allocSize,
+                                                      region_bytes[OverlayParams],
+                                                      region_offset[OverlayParams]);
+            renderer_.uploadHostBufferToDevice(params_view, params->data(), params->size() * sizeof(float));
+            empty_overlay_params_cache_ = std::move(*params);
+        }
+
+        const auto view = [&](const std::size_t region) {
+            return makeBorrowedBufferView(empty_overlay_buffer_.buffer,
+                                          empty_overlay_buffer_.allocSize,
+                                          region_bytes[region],
+                                          region_offset[region]);
+        };
+        OverlayBindingViews views{};
+        views.selection_mask = view(OverlaySelectionMask);
+        views.preview_mask = view(OverlayPreviewMask);
+        views.selection_colors = view(OverlaySelectionColors);
+        views.transform_indices = view(OverlayTransformIndices);
+        views.node_mask = view(OverlayNodeMask);
+        views.overlay_params = view(OverlayParams);
+        views.model_transforms = view(OverlayModelTransforms);
+        views.raster_overlays_active = false;
+        return views;
+    }
+
     void VksplatViewportRenderer::logVramBreakdownIfChanged(const std::string_view reason) {
         const std::size_t owned_total = buffers_.getTotalOwnedAllocSize();
         const std::size_t pipeline_current = renderer_.getCurrentAllocSize();
@@ -3031,18 +3245,25 @@ namespace lfs::vis {
             .width = static_cast<std::uint32_t>(size.x),
             .height = static_cast<std::uint32_t>(size.y),
         };
-        if (!context.createExternalImage(extent,
-                                         VK_FORMAT_R8G8B8A8_UNORM,
-                                         slot.image,
-                                         "vulkan.vksplat.output_image",
-                                         std::format("{}.color.ring{}", outputSlotDiagnosticName(output_slot), ring_slot))) {
+        // Without CUDA/Vulkan external-memory interop (MoltenVK) the output images do
+        // not need to be exportable — opaque-FD image export is unsupported there.
+        // Create plain sampled/storage device-local images and register them as
+        // non-external (no cross-API ownership tracking).
+        const bool interop = context.externalMemoryInteropEnabled();
+        const auto create_output =
+            [&](const VkFormat format, VulkanContext::ExternalImage& out, const std::string_view label) {
+                return interop
+                           ? context.createExternalImage(extent, format, out, "vulkan.vksplat.output_image", label)
+                           : context.createSampledImage(extent, format, out, "vulkan.vksplat.output_image", label);
+            };
+        if (!create_output(VK_FORMAT_R8G8B8A8_UNORM,
+                           slot.image,
+                           std::format("{}.color.ring{}", outputSlotDiagnosticName(output_slot), ring_slot))) {
             return std::unexpected(context.lastError());
         }
-        if (!context.createExternalImage(extent,
-                                         VK_FORMAT_R32_SFLOAT,
-                                         slot.depth_image,
-                                         "vulkan.vksplat.output_image",
-                                         std::format("{}.depth.ring{}", outputSlotDiagnosticName(output_slot), ring_slot))) {
+        if (!create_output(VK_FORMAT_R32_SFLOAT,
+                           slot.depth_image,
+                           std::format("{}.depth.ring{}", outputSlotDiagnosticName(output_slot), ring_slot))) {
             const std::string error = context.lastError();
             context.destroyExternalImage(slot.image);
             return std::unexpected(error);
@@ -3050,11 +3271,11 @@ namespace lfs::vis {
         context.imageBarriers().registerImage(slot.image.image,
                                               VK_IMAGE_ASPECT_COLOR_BIT,
                                               VK_IMAGE_LAYOUT_UNDEFINED,
-                                              /*external=*/true);
+                                              /*external=*/interop);
         context.imageBarriers().registerImage(slot.depth_image.image,
                                               VK_IMAGE_ASPECT_COLOR_BIT,
                                               VK_IMAGE_LAYOUT_UNDEFINED,
-                                              /*external=*/true);
+                                              /*external=*/interop);
         slot.size = size;
         ++slot.generation;
         return {};
@@ -4452,8 +4673,12 @@ namespace lfs::vis {
         if (request.equirectangular && !request.gut) {
             return std::unexpected("VkSplat equirectangular rendering requires the 3DGUT backend");
         }
-        if (!context.externalMemoryInteropEnabled()) {
-            return std::unexpected("VkSplat forward path requires CUDA/Vulkan external-memory interop");
+        // Without CUDA/Vulkan external-memory interop (macOS) the viewer path uploads
+        // inputs via CPU staging (prepareInputsHostCopy) and self-allocates scratch.
+        // The synchronized (training) path still needs interop for the shared arena.
+        if (!context.externalMemoryInteropEnabled() && synchronize_input_upload) {
+            return std::unexpected(
+                "VkSplat synchronized (training) forward path requires CUDA/Vulkan external-memory interop");
         }
 
         const int active_sh_degree = effectiveRenderShDegree(splat_data, request.sh_degree);

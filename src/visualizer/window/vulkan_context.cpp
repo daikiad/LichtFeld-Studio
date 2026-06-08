@@ -2024,6 +2024,109 @@ namespace lfs::vis {
         return true;
     }
 
+    bool VulkanContext::createSampledImage(const VkExtent2D extent,
+                                           const VkFormat format,
+                                           ExternalImage& out,
+                                           const std::string_view diagnostic_scope,
+                                           const std::string_view diagnostic_label) {
+        out = {};
+
+        if (!device_ || !physical_device_) {
+            return fail("Cannot create Vulkan image before device initialization");
+        }
+        if (extent.width == 0 || extent.height == 0 || format == VK_FORMAT_UNDEFINED) {
+            return fail("Vulkan image requires a non-zero extent and defined format");
+        }
+
+        constexpr VkImageUsageFlags usage = VK_IMAGE_USAGE_SAMPLED_BIT |
+                                            VK_IMAGE_USAGE_STORAGE_BIT |
+                                            VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                            VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+
+        out.extent = extent;
+        out.format = format;
+        out.diagnostic_scope = diagnostic_scope.empty() ? "vulkan.sampled.image" : std::string(diagnostic_scope);
+        out.diagnostic_label = makeAllocationDiagnosticLabel(diagnostic_label);
+
+        VkImageCreateInfo image_info{};
+        image_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+        image_info.imageType = VK_IMAGE_TYPE_2D;
+        image_info.extent.width = extent.width;
+        image_info.extent.height = extent.height;
+        image_info.extent.depth = 1;
+        image_info.mipLevels = 1;
+        image_info.arrayLayers = 1;
+        image_info.format = format;
+        image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+        image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        image_info.usage = usage;
+        image_info.samples = VK_SAMPLE_COUNT_1_BIT;
+        // Same cross-queue concern as createExternalImage: compute writes, graphics
+        // samples. CONCURRENT drops the ownership-transfer barriers.
+        std::array<uint32_t, 2> image_families{
+            graphics_queue_family_,
+            has_dedicated_compute_queue_ ? compute_queue_family_ : graphics_queue_family_};
+        if (has_dedicated_compute_queue_) {
+            image_info.sharingMode = VK_SHARING_MODE_CONCURRENT;
+            image_info.queueFamilyIndexCount = static_cast<uint32_t>(image_families.size());
+            image_info.pQueueFamilyIndices = image_families.data();
+        } else {
+            image_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        }
+
+        VkResult result = vkCreateImage(device_, &image_info, nullptr, &out.image);
+        if (result != VK_SUCCESS) {
+            out = {};
+            return fail(std::format("vkCreateImage(sampled) failed: {}", vkResultToString(result)));
+        }
+        setDebugObjectName(VK_OBJECT_TYPE_IMAGE, out.image,
+                           std::format("Sampled image {}x{}", extent.width, extent.height));
+
+        VkMemoryRequirements memory_requirements{};
+        vkGetImageMemoryRequirements(device_, out.image, &memory_requirements);
+        out.allocation_size = memory_requirements.size;
+
+        VkMemoryAllocateInfo allocate_info{};
+        allocate_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        allocate_info.allocationSize = memory_requirements.size;
+        allocate_info.memoryTypeIndex = findMemoryType(memory_requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        if (allocate_info.memoryTypeIndex == std::numeric_limits<uint32_t>::max()) {
+            destroyExternalImage(out);
+            return fail("Could not find Vulkan device-local memory for sampled image");
+        }
+
+        result = vkAllocateMemory(device_, &allocate_info, nullptr, &out.memory);
+        if (result != VK_SUCCESS) {
+            destroyExternalImage(out);
+            return fail(std::format("vkAllocateMemory(sampled image) failed: {}", vkResultToString(result)));
+        }
+        setDebugObjectName(VK_OBJECT_TYPE_DEVICE_MEMORY, out.memory, "Sampled image memory");
+        recordCurrentVulkanBytes(out.diagnostic_scope, out.diagnostic_label, static_cast<std::size_t>(out.allocation_size));
+
+        result = vkBindImageMemory(device_, out.image, out.memory, 0);
+        if (result != VK_SUCCESS) {
+            destroyExternalImage(out);
+            return fail(std::format("vkBindImageMemory(sampled image) failed: {}", vkResultToString(result)));
+        }
+
+        VkImageViewCreateInfo view_info{};
+        view_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        view_info.image = out.image;
+        view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        view_info.format = format;
+        view_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        view_info.subresourceRange.levelCount = 1;
+        view_info.subresourceRange.layerCount = 1;
+
+        result = vkCreateImageView(device_, &view_info, nullptr, &out.view);
+        if (result != VK_SUCCESS) {
+            destroyExternalImage(out);
+            return fail(std::format("vkCreateImageView(sampled image) failed: {}", vkResultToString(result)));
+        }
+        setDebugObjectName(VK_OBJECT_TYPE_IMAGE_VIEW, out.view, "Sampled image view");
+        return true;
+    }
+
     void VulkanContext::destroyExternalImage(ExternalImage& image) {
         if (!image.diagnostic_scope.empty() && !image.diagnostic_label.empty()) {
             recordCurrentVulkanBytes(image.diagnostic_scope, image.diagnostic_label, 0);
