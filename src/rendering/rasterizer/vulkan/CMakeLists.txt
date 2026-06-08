@@ -161,6 +161,9 @@ _vulkan_add_slang_shader(projection_forward_3dgut  vertex_shader.slang EXPORT_MO
 # them. Unused until the backward execute* methods land.
 _vulkan_add_slang_shader(projection_backward                  vertex_shader.slang EXPORT_MODE=1)
 _vulkan_add_slang_shader(fused_projection_backward_optimizer  fused_projection_backward_optimizer.slang)
+# Split-raw fused optimizer: the no-CUDA training path's projection-backward + Adam
+# operating directly on SplatData's split RAW buffers (no pack, no activated round-trip).
+_vulkan_add_slang_shader(fused_projection_backward_optimizer_split fused_projection_backward_optimizer_split.slang)
 _vulkan_add_slang_shader(rasterize_backward_per_splat         alphablend_shader.slang EXPORT_MODE=1 BACKWARD_MODE=1)
 _vulkan_add_slang_shader(rasterize_backward_per_pixel         alphablend_shader.slang EXPORT_MODE=1 BACKWARD_MODE=0)
 _vulkan_add_slang_shader(rasterize_backward_tensor            alphablend_shader.slang EXPORT_MODE=1 BACKWARD_MODE=2)
