@@ -2,16 +2,42 @@
 #
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-# Add fastlfs backend
-add_subdirectory(rasterization/fastgs)
+# Rasterization backends are CUDA libraries. Gate them and provide INTERFACE stubs
+# under the same target names when CUDA is disabled so the link graph resolves.
+# (Phase 1 replaces the stubs with a real macOS forward-render backend.)
+if(LFS_ENABLE_CUDA)
+    # Add fastlfs backend
+    add_subdirectory(rasterization/fastgs)
 
-# Add LibTorch-free gsplat backend
-add_subdirectory(rasterization/gsplat)
+    # Add LibTorch-free gsplat backend
+    add_subdirectory(rasterization/gsplat)
 
-# Add igs+ edge-compute rasterizer
-add_subdirectory(rasterization/edge_compute)
+    # Add igs+ edge-compute rasterizer
+    add_subdirectory(rasterization/edge_compute)
+else()
+    # Stub backends. Re-export the public header dirs the real targets provided so
+    # downstream consumers (lfs_training, the app) still resolve their API headers
+    # (e.g. rasterization_api.h). Method bodies resolve via -undefined dynamic_lookup.
+    add_library(fastlfs_backend INTERFACE)
+    target_include_directories(fastlfs_backend INTERFACE
+        ${CMAKE_CURRENT_SOURCE_DIR}/rasterization/fastgs/rasterization/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/rasterization/fastgs/optimizer/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/rasterization/fastgs/utils
+    )
+    add_library(gsplat_backend_lfs INTERFACE)
+    target_include_directories(gsplat_backend_lfs INTERFACE
+        ${CMAKE_CURRENT_SOURCE_DIR}/rasterization
+        ${CMAKE_CURRENT_SOURCE_DIR}/rasterization/gsplat
+    )
+    add_library(edge_compute_backend INTERFACE)
+    target_include_directories(edge_compute_backend INTERFACE
+        ${CMAKE_CURRENT_SOURCE_DIR}/rasterization/edge_compute/rasterization/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/rasterization/edge_compute/utils
+    )
+endif()
 
-# LibTorch-free CUDA kernels
+# LibTorch-free CUDA kernels (CUDA only; INTERFACE stub otherwise)
+if(LFS_ENABLE_CUDA)
 set(LFS_TRAINING_KERNEL_SOURCES
     kernels/camera_loss_heatmap.cu
     kernels/ssim.cu
@@ -70,6 +96,11 @@ if(MSVC)
             $<$<COMPILE_LANGUAGE:CUDA>:FMT_UNICODE=0>
     )
 endif()
+else()
+    add_library(lfs_training_kernels INTERFACE)
+    target_link_libraries(lfs_training_kernels INTERFACE lfs_core)
+endif() # LFS_ENABLE_CUDA
+
 # Optimizer sources
 set(TRAINING_NEW_SOURCES
     optimizer/adam_optimizer.cpp
@@ -86,8 +117,6 @@ set(TRAINING_NEW_SOURCES
     rasterization/edge_rasterizer.cpp
     components/bilateral_grid.cpp
     components/ppisp.cpp
-    components/ppisp_controller.cu
-    components/ppisp_controller_pool.cu
     components/ppisp_file.cpp
     components/sparsity_optimizer.cpp
     control/command_api.cpp
@@ -96,6 +125,14 @@ set(TRAINING_NEW_SOURCES
     trainer.cpp
     training_setup.cpp
 )
+
+# ppisp_controller{,_pool}.cu are CUDA translation units; CUDA-only.
+if(LFS_ENABLE_CUDA)
+    list(APPEND TRAINING_NEW_SOURCES
+        components/ppisp_controller.cu
+        components/ppisp_controller_pool.cu
+    )
+endif()
 
 # lfs_training - Training module with optimizer
 add_library(lfs_training STATIC ${TRAINING_NEW_SOURCES})

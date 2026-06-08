@@ -5,11 +5,18 @@
 # core module - LibTorch-free core + tensor library (SHARED)
 # ============================================================================
 
-# Tensor CUDA kernels (STATIC, linked privately)
-add_subdirectory(tensor)
-
-# Core CUDA library (STATIC, linked privately)
-add_subdirectory(cuda)
+# Tensor CUDA kernels + core CUDA library (STATIC, linked privately).
+# These compile .cu sources, so they only exist when CUDA is enabled. When CUDA
+# is disabled (e.g. macOS) we expose empty INTERFACE stubs under the same names
+# so the rest of the link graph resolves; the source-level #ifdef LFS_ENABLE_CUDA
+# seam removes the kernel-launch call sites that would otherwise be unresolved.
+if(LFS_ENABLE_CUDA)
+    add_subdirectory(tensor)
+    add_subdirectory(cuda)
+else()
+    add_library(lfs_tensor_kernels INTERFACE)
+    add_library(lfs_core_cuda INTERFACE)
+endif()
 
 # Event bridge shared library
 add_subdirectory(event_bridge)
@@ -39,8 +46,12 @@ set(TENSOR_SOURCES
         tensor/tensor_nn_ops.cpp
         tensor/pinned_memory_allocator.cpp
         tensor/offset_allocator.cpp
-        tensor/tensor_exports.cu
 )
+
+# tensor_exports.cu is a CUDA translation unit; only compile it with CUDA enabled.
+if(LFS_ENABLE_CUDA)
+    list(APPEND TENSOR_SOURCES tensor/tensor_exports.cu)
+endif()
 
 # Core module sources
 set(CORE_SOURCES
@@ -94,8 +105,8 @@ target_link_libraries(lfs_core
         nlohmann_json::nlohmann_json
         glm::glm
         Threads::Threads
-        CUDA::cudart
-        CUDA::curand
+        $<$<BOOL:${LFS_ENABLE_CUDA}>:CUDA::cudart>
+        $<$<BOOL:${LFS_ENABLE_CUDA}>:CUDA::curand>
         spdlog::spdlog
     PRIVATE
         lfs_core_cuda

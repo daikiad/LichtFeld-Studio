@@ -270,7 +270,10 @@ namespace lfs::io {
             if (size > ply_constants::FILE_SIZE_THRESHOLD_MB * 1024 * 1024) {
                 madvise(data, size, MADV_SEQUENTIAL);
                 madvise(data, size, MADV_WILLNEED);
+#ifndef __APPLE__
+                // posix_fadvise is not available on macOS; madvise above covers the hint.
                 posix_fadvise(fd, 0, 0, POSIX_FADV_WILLNEED);
+#endif
             }
 
             return true;

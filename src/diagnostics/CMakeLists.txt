@@ -17,7 +17,7 @@ target_include_directories(lfs_diagnostics
 
 target_link_libraries(lfs_diagnostics
     PUBLIC
-        CUDA::cudart
+        $<$<BOOL:${LFS_ENABLE_CUDA}>:CUDA::cudart>
 )
 
 target_compile_features(lfs_diagnostics PUBLIC cxx_std_23)

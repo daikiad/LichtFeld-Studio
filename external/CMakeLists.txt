@@ -99,9 +99,12 @@ else()
     message(WARNING "OpenMesh not found at external/OpenMesh")
 endif()
 
-# nvImageCodec - GPU-accelerated image codec library
+# nvImageCodec - GPU-accelerated image codec library (CUDA/NVIDIA only).
+# It is its own LANGUAGES CXX CUDA project and cannot configure without a CUDA
+# toolchain, so it is skipped entirely when CUDA is disabled (e.g. on macOS).
+# The image path falls back to OpenImageIO in that configuration.
 find_package(Boost REQUIRED)
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/nvImageCodec/CMakeLists.txt")
+if(LFS_ENABLE_CUDA AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/nvImageCodec/CMakeLists.txt")
     message(STATUS "Adding nvImageCodec")
     if(DEFINED DETECTED_COMPUTE_CAP)
         string(REPLACE "." "" _arch "${DETECTED_COMPUTE_CAP}")

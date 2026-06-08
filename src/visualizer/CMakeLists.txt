@@ -234,7 +234,7 @@ target_link_libraries(lfs_visualizer
         nlohmann_json::nlohmann_json
         OpenSSL::SSL
         OpenSSL::Crypto
-        CUDA::cudart
+        $<$<BOOL:${LFS_ENABLE_CUDA}>:CUDA::cudart>
         nfd::nfd
         vterm
 )
@@ -250,10 +250,14 @@ target_sources(lfs_visualizer
         PRIVATE
         gui/rmlui/rmlui_vk_backend.cpp
         rendering/vksplat_input_packer.cpp
-        rendering/vksplat_input_packer_cuda.cu
         rendering/vksplat_viewport_renderer.cpp
         rendering/vulkan_external_tensor.cpp
         rendering/point_cloud_vulkan_renderer.cpp)
+
+# CUDA splat input packer (feeds the CUDA-Vulkan interop path); CUDA-only.
+if(LFS_ENABLE_CUDA)
+    target_sources(lfs_visualizer PRIVATE rendering/vksplat_input_packer_cuda.cu)
+endif()
 set(glslang_DIR "${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/share/glslang"
     CACHE PATH "Path to vcpkg-installed glslang config" FORCE)
 find_package(glslang CONFIG REQUIRED)
@@ -317,14 +321,26 @@ if(NOT WIN32)
     add_library(lfs_rmlui SHARED "${CMAKE_CURRENT_BINARY_DIR}/lfs_rmlui_stub.cpp")
 
     find_package(lunasvg CONFIG REQUIRED)
-    target_link_libraries(lfs_rmlui PRIVATE
-        -Wl,--whole-archive
-        $<TARGET_FILE:RmlUi::Core>
-        $<TARGET_FILE:RmlUi::Debugger>
-        -Wl,--no-whole-archive
-        Freetype::Freetype
-        lunasvg::lunasvg
-    )
+    # Pull every object from the RmlUi static archives into this wrapper .so/.dylib.
+    # GNU ld uses --whole-archive/--no-whole-archive; macOS ld64 uses per-archive
+    # -force_load instead.
+    if(APPLE)
+        target_link_libraries(lfs_rmlui PRIVATE
+            "-Wl,-force_load,$<TARGET_FILE:RmlUi::Core>"
+            "-Wl,-force_load,$<TARGET_FILE:RmlUi::Debugger>"
+            Freetype::Freetype
+            lunasvg::lunasvg
+        )
+    else()
+        target_link_libraries(lfs_rmlui PRIVATE
+            -Wl,--whole-archive
+            $<TARGET_FILE:RmlUi::Core>
+            $<TARGET_FILE:RmlUi::Debugger>
+            -Wl,--no-whole-archive
+            Freetype::Freetype
+            lunasvg::lunasvg
+        )
+    endif()
 
     get_target_property(_rmlui_includes RmlUi::Core INTERFACE_INCLUDE_DIRECTORIES)
     if(_rmlui_includes)

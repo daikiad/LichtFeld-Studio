@@ -11,6 +11,11 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#elif defined(__APPLE__)
+#include <cstdlib>
+#include <limits.h>
+#include <mach-o/dyld.h>
+#include <unistd.h>
 #else
 #include <limits.h>
 #include <unistd.h>
@@ -40,6 +45,18 @@ namespace lfs::core {
         }
 
         path.resize(size);
+        return std::filesystem::path(path);
+#elif defined(__APPLE__)
+        // macOS has no /proc; use the dyld API and canonicalize.
+        char path[PATH_MAX];
+        uint32_t size = sizeof(path);
+        if (_NSGetExecutablePath(path, &size) != 0) {
+            throw std::runtime_error("_NSGetExecutablePath failed (buffer too small)");
+        }
+        char resolved[PATH_MAX];
+        if (realpath(path, resolved) != nullptr) {
+            return std::filesystem::path(resolved);
+        }
         return std::filesystem::path(path);
 #else
         char path[PATH_MAX];
@@ -168,6 +185,10 @@ namespace lfs::core {
     inline bool tripletLooksLikeCurrentPlatform(const std::string& name) {
 #ifdef _WIN32
         if (name.find("windows") == std::string::npos) {
+            return false;
+        }
+#elif defined(__APPLE__)
+        if (name.find("osx") == std::string::npos) {
             return false;
         }
 #else

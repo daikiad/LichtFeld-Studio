@@ -234,7 +234,11 @@ namespace lfs::vis {
             SDL_Quit();
             return false;
         }
+#ifdef LFS_ENABLE_CUDA
+        // Device-UUID matching only matters for the CUDA<->Vulkan interop path, which
+        // is unavailable without CUDA (e.g. macOS / MoltenVK). Skip it there.
         lfs::rendering::setExpectedVulkanDeviceUuid(vulkan_context_->deviceUUID());
+#endif
         if (!vulkan_context_->presentBootstrapFrame(0.11f, 0.11f, 0.14f, 1.0f)) {
             std::cerr << "Failed to present Vulkan bootstrap frame: " << vulkan_context_->lastError() << std::endl;
             vulkan_context_.reset();

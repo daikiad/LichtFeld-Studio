@@ -8,6 +8,7 @@
 #include "gui/layout_state.hpp"
 #include "gui/panel_registry.hpp"
 #include "gui/ui_context.hpp"
+#include <algorithm> // std::clamp
 #include <cstdint>
 #include <glm/glm.hpp>
 #include <string>

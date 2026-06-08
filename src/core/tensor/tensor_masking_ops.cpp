@@ -10,6 +10,15 @@
 #include <execution>
 #include <format>
 #include <numeric>
+
+// Apple libc++ ships <execution> without the parallel execution policies, so gate
+// the sequenced_policy argument behind the standard feature-test macro. Where it
+// is unavailable the call falls back to the policy-free algorithm overload.
+#if defined(__cpp_lib_execution)
+#define LFS_EXEC_SEQ std::execution::seq,
+#else
+#define LFS_EXEC_SEQ
+#endif
 #include <ranges>
 
 #define CHECK_CUDA(call)                                        \
@@ -513,7 +522,7 @@ namespace lfs::core {
 
             // IMPORTANT: Use sequential execution to avoid TBB threading issues with CUDA
             // TBB worker threads don't have CUDA device context, causing cudaErrorInvalidDevice
-            std::transform(std::execution::seq,
+            std::transform(LFS_EXEC_SEQ
                            idx, idx + indices_same_device.numel(), dst,
                            [src, total](int pos) {
                                if (pos < 0)
@@ -1208,7 +1217,7 @@ namespace lfs::core {
                 } else {
                     // Element-wise assignment
                     size_t num_elements = numel();
-                    std::for_each(std::execution::seq,
+                    std::for_each(LFS_EXEC_SEQ
                                   std::views::iota(size_t(0), idx.numel()).begin(),
                                   std::views::iota(size_t(0), idx.numel()).end(),
                                   [data, indices, values, num_elements](size_t i) {

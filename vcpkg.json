@@ -11,7 +11,10 @@
       "features": [
         "avcodec",
         "avformat",
-        "nvcodec",
+        {
+          "name": "nvcodec",
+          "platform": "!osx"
+        },
         "swscale",
         "x264"
       ]

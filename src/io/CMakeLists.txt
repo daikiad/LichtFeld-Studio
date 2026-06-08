@@ -2,7 +2,9 @@
 #
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-# CUDA library for IO-specific kernels (morton encoding, k-means)
+# CUDA library for IO-specific kernels (morton encoding, k-means).
+# CUDA-only; an INTERFACE stub stands in when CUDA is disabled.
+if(LFS_ENABLE_CUDA)
 add_library(lfs_io_cuda STATIC
         cuda/morton_encoding.hpp
         cuda/morton_encoding.cu
@@ -51,6 +53,10 @@ if(MSVC)
             $<$<COMPILE_LANGUAGE:CUDA>:FMT_UNICODE=0>
     )
 endif()
+else()
+    add_library(lfs_io_cuda INTERFACE)
+    target_link_libraries(lfs_io_cuda INTERFACE lfs_core)
+endif() # LFS_ENABLE_CUDA
 
 # SPZ library (Niantic compressed format) - MIT licensed
 add_library(spz_lib STATIC
@@ -72,13 +78,41 @@ pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET
         libavutil
 )
 
+# On macOS, FFmpeg's static .pc files pull in system frameworks as separate
+# "-framework;Name" list items. CMake's link de-duplication collapses the
+# repeated "-framework" tokens, leaving bare framework names that ld rejects
+# ("no such file or directory: 'CoreFoundation'"). Rewrite each pair into a
+# single "-Wl,-framework,Name" item so it survives as one token.
+if(APPLE AND TARGET PkgConfig::FFMPEG)
+    # The frameworks may live in either INTERFACE_LINK_LIBRARIES or
+    # INTERFACE_LINK_OPTIONS depending on how pkg-config classified them; fix both.
+    foreach(_prop INTERFACE_LINK_LIBRARIES INTERFACE_LINK_OPTIONS)
+        get_target_property(_ffmpeg_items PkgConfig::FFMPEG ${_prop})
+        if(_ffmpeg_items)
+            set(_ffmpeg_fixed "")
+            set(_pending_framework_flag "")
+            foreach(_item IN LISTS _ffmpeg_items)
+                if(_pending_framework_flag)
+                    list(APPEND _ffmpeg_fixed "-Wl,${_pending_framework_flag},${_item}")
+                    set(_pending_framework_flag "")
+                elseif(_item STREQUAL "-framework")
+                    set(_pending_framework_flag "-framework")
+                elseif(_item STREQUAL "-weak_framework")
+                    set(_pending_framework_flag "-weak_framework")
+                else()
+                    list(APPEND _ffmpeg_fixed "${_item}")
+                endif()
+            endforeach()
+            set_target_properties(PkgConfig::FFMPEG PROPERTIES ${_prop} "${_ffmpeg_fixed}")
+        endif()
+    endforeach()
+endif()
+
 add_library(lfs_video STATIC
         include/io/video/video_encoder_interface.hpp
         include/io/video/video_export_options.hpp
         video/video_encoder.hpp
         video/video_encoder.cpp
-        video/color_convert.cuh
-        video/color_convert.cu
         video_frame_extractor.hpp
         video_frame_extractor.cpp
         video_player.hpp
@@ -98,11 +132,16 @@ target_include_directories(lfs_video SYSTEM PRIVATE
     ${CMAKE_SOURCE_DIR}/external
 )
 
+# GPU color-convert kernel is CUDA-only (NVENC path); CPU/x264 path remains on macOS.
+if(LFS_ENABLE_CUDA)
+    target_sources(lfs_video PRIVATE video/color_convert.cu)
+endif()
+
 target_link_libraries(lfs_video
         PRIVATE
         PkgConfig::FFMPEG
         spdlog::spdlog
-        CUDA::cudart
+        $<$<BOOL:${LFS_ENABLE_CUDA}>:CUDA::cudart>
 )
 
 target_compile_features(lfs_video PUBLIC cxx_std_23)
@@ -191,6 +230,7 @@ target_include_directories(lfs_io
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:include>
         PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}   # for "formats/...", "loaders/..." (was propagated via lfs_io_cuda, now stubbed when CUDA off)
         ${CMAKE_SOURCE_DIR}/src
         ${CMAKE_SOURCE_DIR}/external/spz
 )
@@ -249,9 +289,9 @@ target_link_libraries(lfs_io
         ${WEBP_ENCODE_LIB}     # WebP for SOG/HTML export
         ${ARCHIVE_LIB}         # LibArchive for SOG bundle support
         ZLIB::ZLIB             # gzip/msgpack payloads inside NuRec USDZ
-        CUDA::cudart           # CUDA runtime for nvImageCodec
-        lfs_io_cuda            # IO-specific CUDA kernels (morton, k-means)
-        lfs_core_cuda          # Core CUDA utilities (lanczos_resize for nvcodec)
+        $<$<BOOL:${LFS_ENABLE_CUDA}>:CUDA::cudart>  # CUDA runtime for nvImageCodec
+        lfs_io_cuda            # IO-specific CUDA kernels (morton, k-means); stub when CUDA off
+        lfs_core_cuda          # Core CUDA utilities (lanczos_resize for nvcodec); stub when CUDA off
         assimp::assimp         # Multi-format mesh import
         usdVol                 # OpenUSD Gaussian ParticleField import
         $<IF:$<PLATFORM_ID:Windows>,OpenMeshCore,OpenMeshCoreStatic>

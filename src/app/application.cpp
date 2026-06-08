@@ -344,9 +344,13 @@ namespace lfs::app {
                          prop.totalGlobalMem / (1024 * 1024));
             }
 
+#ifdef LFS_ENABLE_CUDA
             LOG_INFO("Initializing CUDA...");
             fast_lfs::rasterization::warmup_kernels();
             lfs::diagnostics::VramProfiler::instance().captureCudaWarmupDelta();
+#else
+            LOG_INFO("CUDA disabled: skipping kernel warmup");
+#endif
         }
 
         void warmupCudaAsync() {
@@ -358,11 +362,15 @@ namespace lfs::app {
                          prop.totalGlobalMem / (1024 * 1024));
             }
 
+#ifdef LFS_ENABLE_CUDA
             LOG_INFO("Initializing CUDA (async)...");
             cudaWarmupFuture() = std::async(std::launch::async, [] {
                 fast_lfs::rasterization::warmup_kernels();
                 lfs::diagnostics::VramProfiler::instance().captureCudaWarmupDelta();
             });
+#else
+            LOG_INFO("CUDA disabled: skipping async kernel warmup");
+#endif
         }
 
         int runGui(std::unique_ptr<lfs::core::param::TrainingParameters> params) {

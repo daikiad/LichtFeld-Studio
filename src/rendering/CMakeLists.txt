@@ -9,14 +9,25 @@ find_package(glslang CONFIG REQUIRED)
 
 set(RENDERING_TENSOR_SOURCES
         cuda_vulkan_interop.cpp
-        cuda_vulkan_interop.cu
-        selection_ops.cu
         raster_rendering_engine.cpp
-        cuda_interaction_kernels.cu
-        point_cloud_raster.cu
         mesh2splat.cpp
         screen_overlay_renderer.cpp
 )
+
+# cuda_vulkan_interop.cpp stays compiled even without CUDA: the CudaVulkanInterop
+# class is held by value inside other types (e.g. VulkanUiTexture), so its
+# ctor/dtor are called unconditionally — they must be real symbols, not deferred.
+# The actual external-memory API calls are no-ops on macOS (see cuda_stub) and are
+# only reached when interop is enabled, which it never is under MoltenVK.
+# The .cu kernels (raster/selection/interaction) ARE CUDA-only and gated out.
+if(LFS_ENABLE_CUDA)
+    list(APPEND RENDERING_TENSOR_SOURCES
+        cuda_vulkan_interop.cu
+        selection_ops.cu
+        cuda_interaction_kernels.cu
+        point_cloud_raster.cu
+    )
+endif()
 
 add_library(lfs_rendering_tensor STATIC ${RENDERING_TENSOR_SOURCES})
 
@@ -24,7 +35,7 @@ target_link_libraries(lfs_rendering_tensor
         PUBLIC
         lfs_core
         PRIVATE
-        CUDA::cudart
+        $<$<BOOL:${LFS_ENABLE_CUDA}>:CUDA::cudart>
         glm::glm
         Vulkan::Vulkan
         glslang::glslang

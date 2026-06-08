@@ -4,7 +4,8 @@
 #include <array>
 #include <chrono>
 #include <cstdint>
-#include <cstring> // memcpy
+#include <cstring>   // memcpy
+#include <exception> // std::terminate
 #include <functional>
 #include <map>
 #include <string>

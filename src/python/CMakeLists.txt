@@ -266,8 +266,8 @@ target_link_libraries(lfs_py PRIVATE
     $<IF:$<PLATFORM_ID:Windows>,OpenMeshCore,OpenMeshCoreStatic>
     $<IF:$<PLATFORM_ID:Windows>,OpenMeshTools,OpenMeshToolsStatic>
     OpenImageIO::OpenImageIO
-    CUDA::cudart
-    CUDA::curand
+    $<$<BOOL:${LFS_ENABLE_CUDA}>:CUDA::cudart>
+    $<$<BOOL:${LFS_ENABLE_CUDA}>:CUDA::curand>
     ${CMAKE_DL_LIBS}
     imgui::imgui
     implot::implot
@@ -349,6 +349,14 @@ option(BUILD_PYTHON_STUBS "Generate Python type stubs (requires loading the modu
 get_property(LFS_GENERATOR_IS_MULTI_CONFIG GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
 if(WIN32 AND NOT LFS_GENERATOR_IS_MULTI_CONFIG AND CMAKE_BUILD_TYPE STREQUAL "Debug")
     message(STATUS "Skipping Python stubs for Debug build (vcpkg Python is release-only)")
+    set(BUILD_PYTHON_STUBS OFF)
+endif()
+
+# On macOS the lichtfeld extension currently cannot be imported (it references CUDA
+# kernel symbols that are deferred on CUDA-less builds), so stubgen — which loads the
+# module — would fail the build. Skip it until the Phase 1 backend provides those.
+if(APPLE)
+    message(STATUS "Skipping Python stubs on macOS (module import requires CUDA kernels; Phase 1)")
     set(BUILD_PYTHON_STUBS OFF)
 endif()
 

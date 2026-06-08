@@ -30,7 +30,50 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS "Debug" "Release" "MinSizeRel" "RelWithDebInfo")
 endif()
 
-project(LichtFeld-Studio VERSION 0.5.2 LANGUAGES CUDA CXX C)
+# CUDA is unavailable on macOS (NVIDIA dropped macOS support after CUDA 11.2), so the
+# toggle defaults off when configuring on a Darwin host, letting the project build
+# GUI/forward-render-first without a CUDA toolchain. Linux/Windows keep CUDA on.
+# CMAKE_HOST_SYSTEM_NAME is available before project(); CMAKE_SYSTEM_NAME/APPLE are not.
+if(CMAKE_HOST_SYSTEM_NAME STREQUAL "Darwin")
+    option(LFS_ENABLE_CUDA "Enable CUDA support (training + CUDA kernels)" OFF)
+else()
+    option(LFS_ENABLE_CUDA "Enable CUDA support (training + CUDA kernels)" ON)
+endif()
+
+# project() LANGUAGES cannot be conditioned with a generator expression, so branch.
+if(LFS_ENABLE_CUDA)
+    project(LichtFeld-Studio VERSION 0.5.2 LANGUAGES CUDA CXX C)
+else()
+    project(LichtFeld-Studio VERSION 0.5.2 LANGUAGES CXX C)
+    message(STATUS "LFS_ENABLE_CUDA=OFF: configuring without CUDA (GUI / forward-render only)")
+endif()
+
+# macOS compatibility shims (e.g. <pty.h> -> <util.h>) on the include path for
+# all Apple builds, independent of the CUDA toggle.
+if(APPLE)
+    include_directories(BEFORE "${CMAKE_CURRENT_SOURCE_DIR}/cmake/macos_compat")
+endif()
+
+# Make the toggle visible to all C/C++/CUDA translation units so the source-level
+# CUDA seam (#ifdef LFS_ENABLE_CUDA) compiles consistently across every target.
+if(LFS_ENABLE_CUDA)
+    add_compile_definitions(LFS_ENABLE_CUDA=1)
+else()
+    # Phase 0 scaffolding: a stub <cuda_runtime.h> on the include path lets host
+    # code that includes CUDA headers compile without a CUDA toolchain. See
+    # cmake/cuda_stub/cuda_runtime.h. Replaced by a real backend in later phases.
+    include_directories(BEFORE "${CMAKE_CURRENT_SOURCE_DIR}/cmake/cuda_stub")
+
+    # The compute kernels (tensor_ops::launch_*, rasterizers, ...) live in the .cu
+    # files excluded from CUDA-less builds, so the host objects that call them have
+    # unresolved references. For Phase 0 (GUI bring-up, no compute) defer those to
+    # runtime via dynamic_lookup: the dylibs/app link and load; calling an
+    # unimplemented kernel aborts with the exact missing symbol, which is the
+    # work-list for the real Phase 1/2 backend. macOS/ld64 only.
+    if(APPLE)
+        add_link_options("LINKER:-undefined,dynamic_lookup")
+    endif()
+endif()
 
 # On Linux, hide symbols pulled in from third-party image / compression static
 # archives so they don't escape into the dynamic symbol tables of the binaries
@@ -210,6 +253,7 @@ if(total_cores GREATER 1)
 endif()
 
 # CUDA setup
+if(LFS_ENABLE_CUDA)
 # On Windows, nvidia-smi.exe is in System32, but CMake might be running as 32-bit
 # which causes WOW64 redirection. Explicitly search in Sysnative to avoid this.
 if(WIN32)
@@ -316,6 +360,7 @@ if(NOT TARGET CUDA::nvToolsExt)
 endif()
 
 message(STATUS "CUDA Toolkit ${CUDAToolkit_VERSION} found at ${CUDAToolkit_TARGET_DIR}")
+endif() # LFS_ENABLE_CUDA
 
 # Find packages
 find_package(TBB REQUIRED)
@@ -464,8 +509,8 @@ target_link_libraries(${PROJECT_NAME}
         PRIVATE
         ${LFS_APP_INTERNAL_LINK_LIBS}
 
-        CUDA::cudart
-        CUDA::curand
+        $<$<BOOL:${LFS_ENABLE_CUDA}>:CUDA::cudart>
+        $<$<BOOL:${LFS_ENABLE_CUDA}>:CUDA::curand>
         spdlog::spdlog
         taywee::args
         OpenImageIO::OpenImageIO

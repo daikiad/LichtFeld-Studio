@@ -5,6 +5,7 @@
 #pragma once
 
 #include "core/cuda/sh_layout.cuh"
+#include "core/export.hpp" // LFS_VIS_API (was pulled in transitively; explicit for portability)
 #include "core/splat_data.hpp"
 
 #include <cstddef>
@@ -35,7 +36,7 @@ namespace lfs::vis::vksplat {
     //
     // The buffers preserve their existing deviceBuffer fields so callers can
     // drop the result straight into VulkanGSPipelineBuffers without a reupload.
-    LFS_VIS_API [[nodiscard]] std::expected<void, std::string> packHostInputs(
+    [[nodiscard]] LFS_VIS_API std::expected<void, std::string> packHostInputs(
         const lfs::core::SplatData& splat_data,
         Buffer<float>& xyz_ws,
         Buffer<float>& rotations,
@@ -46,7 +47,7 @@ namespace lfs::vis::vksplat {
     // Returns sh_coeffs as a freshly allocated vector with size num_splats*16*3.
     // Slot 0 is the DC (sh0) component, slots 1..rest hold shN coefficients,
     // the remainder is zero.
-    LFS_VIS_API [[nodiscard]] std::expected<std::vector<float>, std::string> buildPaddedShReference(
+    [[nodiscard]] LFS_VIS_API std::expected<std::vector<float>, std::string> buildPaddedShReference(
         const lfs::core::SplatData& splat_data);
 
     // GPU-resident packed inputs. Each tensor is contiguous Float32 on CUDA and
@@ -64,7 +65,7 @@ namespace lfs::vis::vksplat {
     // GPU-only packer. Uses the tensor library to compose activations, padding,
     // and the SH reorder via permute+contiguous. Produces output tensors whose
     // raw byte layout matches packHostInputs's host buffers exactly.
-    LFS_VIS_API [[nodiscard]] std::expected<DevicePackedInputs, std::string> packDeviceInputs(
+    [[nodiscard]] LFS_VIS_API std::expected<DevicePackedInputs, std::string> packDeviceInputs(
         const lfs::core::SplatData& splat_data);
 
     struct LFS_VIS_API DeviceInputLayout {
@@ -79,10 +80,10 @@ namespace lfs::vis::vksplat {
     // Zero-intermediate GPU packer for the live Vulkan viewer path. The caller
     // supplies CUDA pointers to a Vulkan-imported buffer; this copies means and
     // writes activated rotation/scale/opacity/SH directly into those regions.
-    LFS_VIS_API [[nodiscard]] std::expected<DeviceInputLayout, std::string> deviceInputLayout(
+    [[nodiscard]] LFS_VIS_API std::expected<DeviceInputLayout, std::string> deviceInputLayout(
         const lfs::core::SplatData& splat_data);
 
-    LFS_VIS_API [[nodiscard]] std::expected<void, std::string> packDeviceInputsToBuffer(
+    [[nodiscard]] LFS_VIS_API std::expected<void, std::string> packDeviceInputsToBuffer(
         const lfs::core::SplatData& splat_data,
         void* xyz_dst,
         void* rotations_dst,
@@ -106,14 +107,14 @@ namespace lfs::vis::vksplat {
     // path above, this keeps log-scale/logit opacity and split SH untouched so
     // shaders can consume the training tensors directly when they are Vulkan
     // external buffers.
-    LFS_VIS_API [[nodiscard]] std::expected<RawDeviceInputLayout, std::string> rawDeviceInputLayout(
+    [[nodiscard]] LFS_VIS_API std::expected<RawDeviceInputLayout, std::string> rawDeviceInputLayout(
         const lfs::core::SplatData& splat_data,
         int upload_sh_degree = -1);
 
     // Copy just raw opacity, baking SplatData::deleted() into the destination
     // when present. This lets the live renderer borrow all other raw tensors
     // directly instead of allocating a full raw-model copy only to honor deletes.
-    LFS_VIS_API [[nodiscard]] std::expected<void, std::string> copyRawOpacityToBuffer(
+    [[nodiscard]] LFS_VIS_API std::expected<void, std::string> copyRawOpacityToBuffer(
         const lfs::core::SplatData& splat_data,
         void* opacity_dst,
         cudaStream_t stream);

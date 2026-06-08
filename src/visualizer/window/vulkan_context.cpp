@@ -1023,6 +1023,19 @@ namespace lfs::vis {
             appendUniqueExtension(extensions, VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
         }
 
+#ifdef __APPLE__
+        // MoltenVK is a "portability" Vulkan implementation. Since Vulkan 1.3 the
+        // loader hides portability drivers unless the app opts in by enabling
+        // VK_KHR_portability_enumeration and setting the enumerate-portability flag
+        // on VkInstanceCreateInfo. Without this, vkCreateInstance returns
+        // VK_ERROR_INCOMPATIBLE_DRIVER on macOS.
+        const bool portability_enumeration_available =
+            extensionAvailable(available_extensions, VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
+        if (portability_enumeration_available) {
+            appendUniqueExtension(extensions, VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
+        }
+#endif
+
         uint32_t available_layer_count = 0;
         vkEnumerateInstanceLayerProperties(&available_layer_count, nullptr);
         std::vector<VkLayerProperties> available_layers(available_layer_count);
@@ -1061,6 +1074,11 @@ namespace lfs::vis {
 
         VkInstanceCreateInfo create_info{};
         create_info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+#ifdef __APPLE__
+        if (portability_enumeration_available) {
+            create_info.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+        }
+#endif
         create_info.pNext = validation_enabled_ ? &debug_create_info : nullptr;
         create_info.pApplicationInfo = &app_info;
         create_info.enabledLayerCount = static_cast<uint32_t>(layers.size());
@@ -1585,15 +1603,32 @@ namespace lfs::vis {
         has_cooperative_matrix_ = enable_coop_matrix_feature;
         has_host_image_copy_ = enable_host_image_copy_feature;
         has_descriptor_indexing_ = supported_features12.descriptorIndexing == VK_TRUE;
+        // CUDA<->Vulkan external-memory/semaphore interop is the data path used to
+        // display CUDA-rendered splats. MoltenVK does not expose these extensions, so
+        // on macOS we degrade to a no-interop context instead of failing: the GUI and
+        // Vulkan-native passes still come up; CUDA-interop splat rendering stays off
+        // until the Phase 1 macOS forward-render path replaces it.
         if (!external_memory_interop_enabled_) {
+#ifdef __APPLE__
+            LOG_WARN("Vulkan external memory interop unavailable (MoltenVK); CUDA-Vulkan splat rendering disabled on macOS");
+#else
             return fail("Vulkan external memory interop is required (KHR_external_memory + platform variant); device is missing the extension(s)");
+#endif
         }
         if (!external_semaphore_interop_enabled_) {
+#ifdef __APPLE__
+            LOG_WARN("Vulkan external timeline-semaphore interop unavailable (MoltenVK) on macOS");
+#else
             return fail("Vulkan external timeline-semaphore interop is required (KHR_external_semaphore + platform variant); device is missing the extension(s)");
+#endif
         }
-        LOG_INFO("Vulkan external memory interop enabled{}",
-                 external_memory_dedicated_allocation_enabled_ ? " with dedicated allocations" : "");
-        LOG_INFO("Vulkan external timeline semaphore interop enabled");
+        if (external_memory_interop_enabled_) {
+            LOG_INFO("Vulkan external memory interop enabled{}",
+                     external_memory_dedicated_allocation_enabled_ ? " with dedicated allocations" : "");
+        }
+        if (external_semaphore_interop_enabled_) {
+            LOG_INFO("Vulkan external timeline semaphore interop enabled");
+        }
         LOG_INFO("Vulkan optional features: descriptor_indexing={} push_descriptor={} shader_object={} extended_dynamic_state3={} cooperative_matrix={} host_image_copy={}",
                  has_descriptor_indexing_,
                  has_push_descriptor_,
