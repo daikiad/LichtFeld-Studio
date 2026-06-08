@@ -18,6 +18,17 @@
 #include <string_view>
 #include <vector>
 
+#ifndef LFS_ENABLE_CUDA
+// CUDA-less builds (macOS): the splat input-packing kernels are gated out. Provide
+// no-op stubs so the symbols exist (the VkSplat CUDA-interop path is never engaged on
+// macOS). Replaced by the Phase 1 macOS forward-render backend.
+namespace lfs::vis::vksplat::detail {
+    cudaError_t launchPackActivatedRotations(const float*, float*, std::size_t, cudaStream_t) { return cudaSuccess; }
+    cudaError_t launchPackScalesOpacs(const float*, const float*, float*, std::size_t, cudaStream_t) { return cudaSuccess; }
+    cudaError_t launchPackOpacityMaskingDeleted(const float*, const bool*, float*, std::size_t, cudaStream_t) { return cudaSuccess; }
+} // namespace lfs::vis::vksplat::detail
+#endif
+
 namespace lfs::vis::vksplat {
     namespace {
         using lfs::core::DataType;

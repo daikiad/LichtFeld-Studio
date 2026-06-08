@@ -201,11 +201,20 @@ namespace lfs::vis {
             }
         }
 
+        SDL_WindowFlags window_flags = SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIDDEN;
+#ifndef __APPLE__
+        // HiDPI back-buffer. On macOS this makes the swapchain pixel-sized (2x) while the
+        // ImGui/RmlUI layout still works in logical points, which mismatches every panel's
+        // dimensions (menu bar disappears, overlays land in the top-left). Until the UI is
+        // made fully pixel-aware, render macOS at point resolution (the OS upscales) so the
+        // whole GUI shares one coordinate space. Sharpness is a follow-up.
+        window_flags |= SDL_WINDOW_HIGH_PIXEL_DENSITY;
+#endif
         window_ = SDL_CreateWindow(
             title_.c_str(),
             window_size_.x,
             window_size_.y,
-            SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY | SDL_WINDOW_HIDDEN);
+            window_flags);
 
         if (!window_) {
             std::cerr << "Failed to create SDL window: " << SDL_GetError() << std::endl;

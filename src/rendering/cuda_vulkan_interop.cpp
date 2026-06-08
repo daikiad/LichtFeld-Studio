@@ -270,6 +270,22 @@ namespace lfs::rendering {
             CudaVulkanTensorLayout layout,
             bool flip_y,
             const cudaStream_t stream);
+
+#ifndef LFS_ENABLE_CUDA
+        // CUDA-less builds (macOS): the CUDA<->Vulkan interop copy is never reached at
+        // runtime (interop is reported unavailable), but the symbols must exist so the
+        // module links/loads. No-op stubs replacing the gated .cu definitions.
+        [[nodiscard]] cudaError_t launchCudaVulkanCopyTensorToSurface(
+            cudaSurfaceObject_t, const void*, std::uint32_t, std::uint32_t, int,
+            CudaVulkanTensorLayout, CudaVulkanTensorElementType, bool, const cudaStream_t) {
+            return cudaSuccess;
+        }
+        [[nodiscard]] cudaError_t launchCudaVulkanCopyTensorToSurfaceR32f(
+            cudaSurfaceObject_t, const float*, std::uint32_t, std::uint32_t, int,
+            CudaVulkanTensorLayout, bool, const cudaStream_t) {
+            return cudaSuccess;
+        }
+#endif
     } // namespace detail
 
     CudaVulkanInterop::CudaVulkanInterop(CudaVulkanExternalImageImport image,

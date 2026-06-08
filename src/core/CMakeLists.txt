@@ -49,8 +49,15 @@ set(TENSOR_SOURCES
 )
 
 # tensor_exports.cu is a CUDA translation unit; only compile it with CUDA enabled.
+# Without CUDA, the non-templated kernel launchers (defined in the gated .cu files)
+# are provided as CPU/no-op stubs so lfs_core links and the Python module imports.
 if(LFS_ENABLE_CUDA)
     list(APPEND TENSOR_SOURCES tensor/tensor_exports.cu)
+else()
+    list(APPEND TENSOR_SOURCES tensor/tensor_ops_cpu_stub.cpp)
+    # Fallbacks for the gated core CUDA libs (memory arena / exportable blocks /
+    # selection / SH swizzle) that are normally in add_subdirectory(cuda).
+    list(APPEND TENSOR_SOURCES cuda_stubs_cpu.cpp)
 endif()
 
 # Core module sources

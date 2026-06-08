@@ -27,8 +27,9 @@ namespace lfs::core {
 #include <cfloat>
 #define CUDA_INFINITY FLT_MAX
 #else
-// Forward declaration for C++ files - implementation in tensor_ops.cu
 namespace lfs::core::tensor_ops {
+#ifdef LFS_ENABLE_CUDA
+    // CUDA build: C++ TUs link to explicit instantiations compiled in tensor_ops.cu.
     template <typename InT, typename OutT, typename Op>
     LFS_CORE_API void launch_binary_op_generic(const InT* a, const InT* b, OutT* c, size_t n,
                                                Op op, cudaStream_t stream = nullptr);
@@ -40,6 +41,32 @@ namespace lfs::core::tensor_ops {
     template <typename T, typename OutputT, typename Op>
     LFS_CORE_API void launch_scalar_op_generic(const T* data, T scalar, OutputT* result, size_t n,
                                                Op op, cudaStream_t stream = nullptr);
+#else
+    // CUDA-less build (e.g. macOS): generic CPU fallbacks so every instantiation is
+    // defined inline (the .cu explicit instantiations are absent). This is the start of
+    // the CPU tensor backend; the stream argument is ignored. Op is the same functor the
+    // CUDA path uses, so results match.
+    template <typename InT, typename OutT, typename Op>
+    inline void launch_binary_op_generic(const InT* a, const InT* b, OutT* c, size_t n,
+                                         Op op, cudaStream_t = nullptr) {
+        for (size_t i = 0; i < n; ++i)
+            c[i] = op(a[i], b[i]);
+    }
+
+    template <typename T, typename OutT, typename Op>
+    inline void launch_unary_op_generic(const T* input, OutT* output, size_t n,
+                                        Op op, cudaStream_t = nullptr) {
+        for (size_t i = 0; i < n; ++i)
+            output[i] = op(input[i]);
+    }
+
+    template <typename T, typename OutputT, typename Op>
+    inline void launch_scalar_op_generic(const T* data, T scalar, OutputT* result, size_t n,
+                                         Op op, cudaStream_t = nullptr) {
+        for (size_t i = 0; i < n; ++i)
+            result[i] = op(data[i], scalar);
+    }
+#endif
 } // namespace lfs::core::tensor_ops
 #define CUDA_INFINITY INFINITY
 #endif
@@ -112,8 +139,17 @@ namespace lfs::core::tensor_ops {
                                      DataType dtype, cudaStream_t stream);
 
     // Unified Type Conversion Template
+#ifdef LFS_ENABLE_CUDA
     template <typename SrcT, typename DstT>
     void launch_convert_type(const SrcT* src, DstT* dst, size_t n, cudaStream_t stream);
+#else
+    // CPU fallback for CUDA-less builds.
+    template <typename SrcT, typename DstT>
+    inline void launch_convert_type(const SrcT* src, DstT* dst, size_t n, cudaStream_t = nullptr) {
+        for (size_t i = 0; i < n; ++i)
+            dst[i] = static_cast<DstT>(src[i]);
+    }
+#endif
 
     // ============= Broadcasting =============
     LFS_CORE_API void launch_broadcast(const float* src, float* dst,
@@ -207,13 +243,56 @@ namespace lfs::core::tensor_ops {
 #ifdef __CUDACC__
 #include "tensor_broadcast_ops.cuh"
 #else
-// Forward declaration for C++ files - implementation in tensor_broadcast_ops.cu
 namespace lfs::core::tensor_ops {
+#ifdef LFS_ENABLE_CUDA
+    // Forward declaration for C++ files - implementation in tensor_broadcast_ops.cu
     template <typename T, typename OutputT, typename BinaryOp>
     LFS_CORE_API void launch_broadcast_binary(const T* a, const T* b, OutputT* c,
                                               const size_t* a_shape, const size_t* b_shape, const size_t* c_shape,
                                               size_t a_rank, size_t b_rank, size_t c_rank,
                                               size_t c_elements, BinaryOp op, cudaStream_t stream);
+#else
+    // CPU fallback (CUDA-less builds): numpy-style broadcasting on the host. Shapes are
+    // right-aligned; size-1 dims broadcast. Ranks are small (<= 16).
+    template <typename T, typename OutputT, typename BinaryOp>
+    inline void launch_broadcast_binary(const T* a, const T* b, OutputT* c,
+                                        const size_t* a_shape, const size_t* b_shape, const size_t* c_shape,
+                                        size_t a_rank, size_t b_rank, size_t c_rank,
+                                        size_t c_elements, BinaryOp op, cudaStream_t = nullptr) {
+        constexpr size_t kMaxRank = 16;
+        if (c_rank > kMaxRank)
+            return;
+        auto contig = [](const size_t* shape, size_t rank, size_t* strides) {
+            size_t s = 1;
+            for (size_t i = 0; i < rank; ++i) {
+                const size_t d = rank - 1 - i;
+                strides[d] = s;
+                s *= shape[d];
+            }
+        };
+        size_t c_strides[kMaxRank] = {0};
+        size_t a_strides[kMaxRank] = {0};
+        size_t b_strides[kMaxRank] = {0};
+        contig(c_shape, c_rank, c_strides);
+        contig(a_shape, a_rank, a_strides);
+        contig(b_shape, b_rank, b_strides);
+        const long a_off_rank = static_cast<long>(c_rank) - static_cast<long>(a_rank);
+        const long b_off_rank = static_cast<long>(c_rank) - static_cast<long>(b_rank);
+        for (size_t lin = 0; lin < c_elements; ++lin) {
+            size_t a_off = 0, b_off = 0;
+            for (size_t d = 0; d < c_rank; ++d) {
+                const size_t coord = (c_strides[d] ? (lin / c_strides[d]) : lin) % c_shape[d];
+                const long ad = static_cast<long>(d) - a_off_rank;
+                if (ad >= 0 && a_shape[ad] != 1)
+                    a_off += coord * a_strides[ad];
+                const long bd = static_cast<long>(d) - b_off_rank;
+                if (bd >= 0 && b_shape[bd] != 1)
+                    b_off += coord * b_strides[bd];
+            }
+            c[lin] = op(a[a_off], b[b_off]);
+        }
+    }
+#endif
 }
 #endif
 

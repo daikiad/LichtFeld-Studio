@@ -17,9 +17,11 @@
 #include <unordered_map>
 #include <vector>
 
+#include "core/export.hpp"
+
 namespace lfs::core {
 
-    class RasterizerMemoryArena {
+    class LFS_CORE_API RasterizerMemoryArena {
     public:
         struct Config {
             size_t virtual_size = 32ULL << 30; // 32GB virtual address space (free!)
@@ -203,7 +205,7 @@ namespace lfs::core {
         void empty_cuda_cache();
     };
 
-    class GlobalArenaManager {
+    class LFS_CORE_API GlobalArenaManager {
     public:
         static GlobalArenaManager& instance();
         RasterizerMemoryArena& get_arena();

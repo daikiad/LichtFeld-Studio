@@ -3071,6 +3071,16 @@ namespace lfs::vis::gui {
         if (saved_scale <= 0.0f)
             saved_scale = SDL_GetWindowDisplayScale(viewer_->getWindow());
         current_ui_scale_ = std::clamp(saved_scale, 1.0f, 4.0f);
+#ifdef __APPLE__
+        // macOS renders at point resolution (HiDPI back-buffer disabled in WindowManager),
+        // so the UI density must follow the window pixel density (1.0), not the display
+        // content scale (2.0). Otherwise every element is laid out 2x too large for the
+        // point-sized framebuffer and the layout breaks. Overrides any stale saved pref.
+        {
+            const float density = SDL_GetWindowPixelDensity(viewer_->getWindow());
+            current_ui_scale_ = density > 0.0f ? density : 1.0f;
+        }
+#endif
 
         lfs::python::set_shared_dpi_scale(current_ui_scale_);
         lfs::vis::setThemeDpiScale(current_ui_scale_);

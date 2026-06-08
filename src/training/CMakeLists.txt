@@ -132,6 +132,9 @@ if(LFS_ENABLE_CUDA)
         components/ppisp_controller.cu
         components/ppisp_controller_pool.cu
     )
+else()
+    # CPU/no-op fallback for the gated PPISPControllerPool CUDA implementation.
+    list(APPEND TRAINING_NEW_SOURCES components/ppisp_controller_pool_cpu_stub.cpp)
 endif()
 
 # lfs_training - Training module with optimizer

@@ -30,6 +30,15 @@
 #include <string_view>
 #include <vector>
 
+#ifndef LFS_ENABLE_CUDA
+// CUDA-less builds (macOS): the point-cloud CUDA rasterizer is gated out; provide a
+// no-op stub so the symbol exists. This path is only hit once scene rendering is
+// wired to a macOS backend (Phase 1); until then callers handle the empty result.
+namespace lfs::rendering::pcraster {
+    cudaError_t launchPointCloudRaster(const LaunchParams&) { return cudaSuccess; }
+} // namespace lfs::rendering::pcraster
+#endif
+
 namespace lfs::rendering {
 
     namespace {

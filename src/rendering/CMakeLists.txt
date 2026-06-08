@@ -27,6 +27,9 @@ if(LFS_ENABLE_CUDA)
         cuda_interaction_kernels.cu
         point_cloud_raster.cu
     )
+else()
+    # CPU/no-op fallbacks for the gated selection CUDA kernels.
+    list(APPEND RENDERING_TENSOR_SOURCES selection_ops_cpu_stub.cpp)
 endif()
 
 add_library(lfs_rendering_tensor STATIC ${RENDERING_TENSOR_SOURCES})
