@@ -379,6 +379,7 @@ namespace lfs::vis {
         _VulkanBuffer empty_overlay_buffer_{};
         std::size_t empty_overlay_total_bytes_ = 0;
         std::vector<float> empty_overlay_params_cache_;
+        std::vector<float> empty_overlay_model_transforms_cache_;
         std::size_t last_vram_report_signature_ = 0;
 
         struct SharedScratchArena {

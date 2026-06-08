@@ -127,7 +127,11 @@ float3x3 quat_to_rotmat(float4 q) {
 
 struct Camera : IDifferentiable
 {
-    float3x4 world_view_transform;
+    // Full 4x4 (bottom row 0,0,0,1). MoltenVK miscompiles the non-square float3x4
+    // (Metal stores it as 4x3) — row access returned wrong data and collapsed every
+    // splat to the image centre. A square float4x4 is portable; helpers below derive
+    // the rotation / translation / world camera origin without any non-square type.
+    float4x4 world_view_transform;
     float fx, fy, cx, cy;
     float4 dist_coeffs;
     int H, W, model;
@@ -139,15 +143,44 @@ Camera load_camera(
     float fx, float fy, float cx, float cy, int model, float4 dist_coeffs,
     uint H, uint W
 ) {
-    return { float3x4(world_view_transform_t), fx, fy, cx, cy, dist_coeffs, H, W, model};
+    return { world_view_transform_t, fx, fy, cx, cy, dist_coeffs, H, W, model};
 }
 
+// View-matrix accessors that avoid non-square matrix types (broken on MoltenVK).
+[ForceInline]
+[Differentiable]
+float3x3 cam_view_rotation(Camera cam) {
+    return (float3x3)cam.world_view_transform; // top-left 3x3 = R
+}
+[ForceInline]
+[Differentiable]
+float3 cam_view_translation(Camera cam) {
+    const float4x4 m = cam.world_view_transform;
+    return float3(m[0][3], m[1][3], m[2][3]); // column 3 = t
+}
+[ForceInline]
+[Differentiable]
+float3x3 cam_view_to_world_rotation(Camera cam) {
+    return transpose(cam_view_rotation(cam)); // R^T
+}
+[ForceInline]
+[Differentiable]
+float3 cam_origin_ws(Camera cam) {
+    return -mul(cam_view_to_world_rotation(cam), cam_view_translation(cam)); // -R^T t
+}
 
 [ForceInline]
 [Differentiable]
-float3 geom_transform_points(float3 point, float3x4 transf_matrix)
+float3 geom_transform_points(float3 point, float4x4 m)
 {
-    return mul(transf_matrix, float4(point, 1.0));
+    // Explicit per-element multiply. MoltenVK miscompiles whole-row vector access
+    // (m[i] / dot(m[i], v)) for some rows — the middle (y) row read as zero and
+    // collapsed every splat to the image centre — but scalar element access m[i][j]
+    // is correct. Spell out the dot products with scalar indices only.
+    return float3(
+        m[0][0] * point.x + m[0][1] * point.y + m[0][2] * point.z + m[0][3],
+        m[1][0] * point.x + m[1][1] * point.y + m[1][2] * point.z + m[1][3],
+        m[2][0] * point.x + m[2][1] * point.y + m[2][2] * point.z + m[2][3]);
 }
 
 [Differentiable]
@@ -528,9 +561,8 @@ WorldRay pixel_to_world_ray(float2 pixel, Camera cam) {
         uv = undistort_point_kkpp(uv, cam.dist_coeffs);
     }
 
-    float4x3 world_view_t = transpose(cam.world_view_transform);
-    float3x3 view_to_world_rotation = float3x3(world_view_t);
-    float3 camera_origin = -mul(view_to_world_rotation, world_view_t[3]);
+    float3x3 view_to_world_rotation = cam_view_to_world_rotation(cam);
+    float3 camera_origin = cam_origin_ws(cam);
     if (cam.model == int(CameraModel::EQUIRECTANGULAR)) {
         float azimuth = 2.0f * M_PI * (pixel.x / float(cam.W) - 0.5f);
         float elevation = M_PI * (pixel.y / float(cam.H) - 0.5f);
@@ -554,20 +586,15 @@ WorldRay pixel_to_world_ray(float2 pixel, Camera cam) {
 
 [ForceInline]
 float3 camera_origin_ws(Camera cam) {
-    float4x3 world_view_t = transpose(cam.world_view_transform);
-    float3x3 view_to_world_rotation = float3x3(world_view_t);
-    return -mul(view_to_world_rotation, world_view_t[3]);
+    return cam_origin_ws(cam);
 }
 
 [ForceInline]
 float3 view_direction_to_point(float3 world_point, Camera cam) {
-    float4x3 world_view_t = transpose(cam.world_view_transform);
-    float3x3 view_to_world_rotation = float3x3(world_view_t);
     if (cam.model == int(CameraModel::ORTHO)) {
-        return safe_normalize(mul(view_to_world_rotation, float3(0.0f, 0.0f, 1.0f)));
+        return safe_normalize(mul(cam_view_to_world_rotation(cam), float3(0.0f, 0.0f, 1.0f)));
     }
-    float3 camera_origin = -mul(view_to_world_rotation, world_view_t[3]);
-    return safe_normalize(world_point - camera_origin);
+    return safe_normalize(world_point - cam_origin_ws(cam));
 }
 
 // Matches CUDA reference forward kernel: clamp the projected 2D covariance

@@ -248,7 +248,18 @@ void main() {
   barrier();
 
   for (uint i = index; i < PARTITION_SIZE; i += WORKGROUP_SIZE) {
-    uint32_t value = localHistogram[i];
-    valuesOut.data[localOffsets1[i / WORKGROUP_SIZE]] = value;
+    // Bounds-guard the value scatter exactly like the key scatter above. Padding
+    // slots (keyIndex >= elementCount) carry sentinel keys whose dstOffset can land at
+    // or past elementCount (up to the partition-rounded count). The key write is
+    // already guarded; the value write was not, so valuesOut was written out of bounds
+    // whenever elementCount is not a whole multiple of the partition size. Desktop
+    // drivers absorb the stray write, but under MoltenVK's tight VMA placement it lands
+    // in the next buffer's memory — zeroing visible_count / tile counts and blanking
+    // the render.
+    uint32_t dstOffset = localOffsets1[i / WORKGROUP_SIZE];
+    if (dstOffset < elementCount) {
+      uint32_t value = localHistogram[i];
+      valuesOut.data[dstOffset] = value;
+    }
   }
 }

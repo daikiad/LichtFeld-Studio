@@ -1292,6 +1292,7 @@ namespace lfs::vis {
             empty_overlay_buffer_ = {};
             empty_overlay_total_bytes_ = 0;
             empty_overlay_params_cache_.clear();
+            empty_overlay_model_transforms_cache_.clear();
             renderer_.cleanupBuffers(buffers_);
             renderer_.cleanup();
         }
@@ -3069,7 +3070,12 @@ namespace lfs::vis {
             const std::vector<float> zeros(total_bytes / sizeof(float), 0.0f);
             renderer_.uploadHostBufferToDevice(empty_overlay_buffer_, zeros.data(), total_bytes);
             empty_overlay_total_bytes_ = total_bytes;
+            // Both region caches must be invalidated on realloc: the buffer was just
+            // zeroed, so a surviving cache that matches the new scene (e.g. both the
+            // identity model transform) would skip the re-upload and leave the region
+            // zero — collapsing every splat to the origin.
             empty_overlay_params_cache_.clear();
+            empty_overlay_model_transforms_cache_.clear();
         }
 
         // Disabled overlay-params table (filters still honored if the request has them).
@@ -3089,6 +3095,25 @@ namespace lfs::vis {
                                                       region_offset[OverlayParams]);
             renderer_.uploadHostBufferToDevice(params_view, params->data(), params->size() * sizeof(float));
             empty_overlay_params_cache_ = std::move(*params);
+        }
+
+        // model_transforms is NOT an overlay — it is the per-node scene transform the
+        // projection applies to every splat when uniforms.step>0. Leaving it zeroed
+        // multiplied every mean by a zero matrix and collapsed the model to the origin.
+        // Upload the real transforms (mostly identity for a single node).
+        if (model_count > 0) {
+            auto mt = buildModelTransformsCpuFloats(request.scene.model_transforms);
+            if (!mt) {
+                return std::unexpected(mt.error());
+            }
+            if (*mt != empty_overlay_model_transforms_cache_) {
+                auto mt_view = makeBorrowedBufferView(empty_overlay_buffer_.buffer,
+                                                      empty_overlay_buffer_.allocSize,
+                                                      region_bytes[OverlayModelTransforms],
+                                                      region_offset[OverlayModelTransforms]);
+                renderer_.uploadHostBufferToDevice(mt_view, mt->data(), mt->size() * sizeof(float));
+                empty_overlay_model_transforms_cache_ = std::move(*mt);
+            }
         }
 
         const auto view = [&](const std::size_t region) {

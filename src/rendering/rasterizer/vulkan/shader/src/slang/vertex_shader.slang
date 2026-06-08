@@ -83,8 +83,7 @@ Splat_2D_Vertex project_gaussian_to_camera(Gaussian_3D g, Camera cam, uint activ
     }
     xyz_vs.xy -= 0.5;  // pixel offset
 
-    float4x3 mat = transpose(cam.world_view_transform);
-    float3 cam_pos = -mul(float3x3(mat), mat[3]);
+    float3 cam_pos = cam_origin_ws(cam);
     float3 dir = float3(normalize(g.xyz_ws - cam_pos));
     float3 rgb = compute_color_from_sh_coeffs(g.sh_coeffs, dir, active_sh);
 
