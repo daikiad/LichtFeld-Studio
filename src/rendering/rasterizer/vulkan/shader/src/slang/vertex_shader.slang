@@ -709,7 +709,7 @@ void main(
 
     write_v_xyz_ws(g_idx, v_gauss.d.xyz_ws);
     write_spherical_harmonics_coeffs_grads(
-      v_gauss.d.sh_coeffs, g_idx, v_sh_coeffs, active_sh, step);
+      v_gauss.d.sh_coeffs, g_idx, v_sh_coeffs, active_sh, uniforms.step);
     v_rotations[g_idx] = v_gauss.d.rotations;
     v_scales_opacs[g_idx] = float4(v_gauss.d.scales, v_gauss.d.opacities);
 

@@ -129,7 +129,9 @@ function(_vulkan_add_glsl_shader OUT_NAME SRC_FILE)
         set(VULKAN_RASTERIZER_SHADER_OUTPUTS ${VULKAN_RASTERIZER_SHADER_OUTPUTS} ${_out} PARENT_SCOPE)
 endfunction()
 
-# Forward path only: trainer / backward shaders are not compiled here.
+# Forward path + the (previously orphaned) backward/training shaders — see the
+# backward block below. The CUDA fastgs trainer does not use these; they back the
+# no-CUDA Vulkan-native training path being built up.
 
 # cumsum.slang → 4 phases
 _vulkan_add_slang_shader(cumsum_block_scan         cumsum.slang CUMSUM_PHASE=1)
@@ -152,6 +154,18 @@ _vulkan_add_slang_shader(compact_visible_primitives compact_visible_primitives.s
 # vertex_shader.slang → projection_forward variants
 _vulkan_add_slang_shader(projection_forward        vertex_shader.slang EXPORT_MODE=0)
 _vulkan_add_slang_shader(projection_forward_3dgut  vertex_shader.slang EXPORT_MODE=0 LFS_3DGUT_PROJECTION=1)
+
+# Backward / training shaders. The differentiable math (Slang reverse-mode autodiff)
+# already lives in these shaders but had never been compiled (the host driver is being
+# built up for the no-CUDA Vulkan training path). Compile them so the driver can bind
+# them. Unused until the backward execute* methods land.
+_vulkan_add_slang_shader(projection_backward                  vertex_shader.slang EXPORT_MODE=1)
+_vulkan_add_slang_shader(fused_projection_backward_optimizer  fused_projection_backward_optimizer.slang)
+_vulkan_add_slang_shader(rasterize_backward_per_splat         alphablend_shader.slang EXPORT_MODE=1 BACKWARD_MODE=1)
+_vulkan_add_slang_shader(rasterize_backward_per_pixel         alphablend_shader.slang EXPORT_MODE=1 BACKWARD_MODE=0)
+_vulkan_add_slang_shader(rasterize_backward_tensor            alphablend_shader.slang EXPORT_MODE=1 BACKWARD_MODE=2)
+_vulkan_add_slang_shader(ssim_forward                         ssim.slang EXPORT_MODE=0)
+_vulkan_add_slang_shader(ssim_backward                        ssim.slang EXPORT_MODE=1)
 
 # selection_mask.slang → compact 1-byte-per-splat brush/rectangle/polygon masks
 _vulkan_add_slang_shader(selection_mask            selection_mask.slang)
