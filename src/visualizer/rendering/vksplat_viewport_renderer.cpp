@@ -237,6 +237,11 @@ namespace lfs::vis {
                  (root / "generated/compose_tile_batches.spv").string()},
                 {"compose_tile_batches_plain",
                  (root / "generated/compose_tile_batches_plain.spv").string()},
+                // backward / training (no-CUDA Vulkan path)
+                {"rasterize_backward_per_pixel",
+                 (root / "generated/rasterize_backward_per_pixel.spv").string()},
+                {"fused_projection_backward_optimizer_split",
+                 (root / "generated/fused_projection_backward_optimizer_split.spv").string()},
                 {"cumsum_single_pass", (root / "generated/cumsum_single_pass.spv").string()},
                 {"cumsum_block_scan", (root / "generated/cumsum_block_scan.spv").string()},
                 {"cumsum_scan_block_sums", (root / "generated/cumsum_scan_block_sums.spv").string()},

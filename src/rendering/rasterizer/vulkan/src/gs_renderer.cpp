@@ -235,6 +235,17 @@ void VulkanGSRenderer::initializeExternal(const std::map<std::string, std::strin
     createComputePipeline(pipeline_tile_batch_descriptors, spirv_paths.at("tile_batch_descriptors"));
     createComputePipeline(pipeline_compose_tile_batches, spirv_paths.at("compose_tile_batches"));
     createComputePipeline(pipeline_compose_tile_batches_plain, spirv_paths.at("compose_tile_batches_plain"));
+    // backward / training pipelines (no-CUDA Vulkan path). Guarded: callers that do not
+    // provide the backward SPIR-V (e.g. forward-only setups) simply leave them null.
+    if (spirv_paths.count("rasterize_backward_per_pixel")) {
+        for (int i = 0; i < 2; ++i)
+            createComputePipeline(pipeline_rasterize_backward_per_pixel[i],
+                                  spirv_paths.at("rasterize_backward_per_pixel"));
+    }
+    if (spirv_paths.count("fused_projection_backward_optimizer_split")) {
+        createComputePipeline(pipeline_fused_projection_backward_optimizer_split,
+                              spirv_paths.at("fused_projection_backward_optimizer_split"));
+    }
     createComputePipeline(pipeline_cumsum.single_pass, spirv_paths.at("cumsum_single_pass"));
     createComputePipeline(pipeline_cumsum.block_scan, spirv_paths.at("cumsum_block_scan"));
     createComputePipeline(pipeline_cumsum.scan_block_sums, spirv_paths.at("cumsum_scan_block_sums"));
@@ -673,6 +684,133 @@ void VulkanGSRenderer::executeRasterizeForward(
                 overlay_params,
             }));
     }
+}
+
+// --- backward / training (no-CUDA Vulkan path) -----------------------------------
+
+void VulkanGSRenderer::executeRasterizeBackward(
+    const VulkanGSRendererUniforms& uniforms, VulkanGSPipelineBuffers& buffers) {
+    if (buffers.num_indices == 0)
+        return;
+    DEVICE_GUARD;
+    const size_t N = buffers.num_splats;
+
+    // Make every forward-produced input + the uploaded upstream gradient visible.
+    bufferMemoryBarrier(
+        {
+            {buffers.sorted_gauss_idx().deviceBuffer, COMPUTE_SHADER_WRITE},
+            {buffers.tile_ranges.deviceBuffer, COMPUTE_SHADER_WRITE},
+            {buffers.xy_vs.deviceBuffer, COMPUTE_SHADER_WRITE},
+            {buffers.inv_cov_vs_opacity.deviceBuffer, COMPUTE_SHADER_WRITE},
+            {buffers.rgb.deviceBuffer, COMPUTE_SHADER_WRITE},
+            {buffers.pixel_state.deviceBuffer, COMPUTE_SHADER_WRITE},
+            {buffers.n_contributors.deviceBuffer, COMPUTE_SHADER_WRITE},
+            {buffers.v_current_pixel_state.deviceBuffer, TRANSFER_COMPUTE_SHADER_WRITE},
+        },
+        COMPUTE_SHADER_READ);
+
+    // The blending backward scatters with InterlockedAddF32, so the grad outputs must
+    // start zeroed and be visible as read-write.
+    auto& v_xy = clearDeviceBuffer(buffers.v_xy_vs, 2 * N);
+    auto& v_icov = clearDeviceBuffer(buffers.v_inv_cov_vs_opacity, 4 * N);
+    auto& v_rgb = clearDeviceBuffer(buffers.v_rgb, 3 * N);
+    bufferMemoryBarrier(
+        {
+            {v_xy, TRANSFER_COMPUTE_SHADER_WRITE},
+            {v_icov, TRANSFER_COMPUTE_SHADER_WRITE},
+            {v_rgb, TRANSFER_COMPUTE_SHADER_WRITE},
+        },
+        COMPUTE_SHADER_READ_WRITE);
+
+    executeCompute(
+        {{uniforms.image_width, TILE_WIDTH}, {uniforms.image_height, TILE_HEIGHT}},
+        &uniforms, sizeof(uniforms),
+        pipeline_rasterize_backward_per_pixel[buffers.is_unsorted_1],
+        std::vector<_VulkanBuffer>({
+            buffers.sorted_gauss_idx().deviceBuffer,    // 0
+            buffers.tile_ranges.deviceBuffer,           // 1
+            buffers.xy_vs.deviceBuffer,                 // 2
+            buffers.inv_cov_vs_opacity.deviceBuffer,    // 3
+            buffers.rgb.deviceBuffer,                   // 4
+            buffers.pixel_state.deviceBuffer,           // 5  final_pixel_state
+            buffers.n_contributors.deviceBuffer,        // 6
+            buffers.v_current_pixel_state.deviceBuffer, // 7  upstream dL/d(pixel)
+            v_xy,                                       // 8  out
+            v_icov,                                     // 9  out
+            v_rgb,                                      // 10 out
+        }));
+}
+
+void VulkanGSRenderer::executeFusedProjectionBackwardOptimizerSplit(
+    const FusedSplitOptimizerUniforms& uniforms, VulkanGSPipelineBuffers& buffers) {
+    DEVICE_GUARD;
+    const size_t N = buffers.num_splats;
+
+    bufferMemoryBarrier(
+        {
+            {buffers.xyz_ws.deviceBuffer, COMPUTE_SHADER_READ_WRITE},
+            {buffers.sh0.deviceBuffer, COMPUTE_SHADER_READ_WRITE},
+            {buffers.shN.deviceBuffer, COMPUTE_SHADER_WRITE},
+            {buffers.rotations.deviceBuffer, COMPUTE_SHADER_READ_WRITE},
+            {buffers.scaling_raw.deviceBuffer, COMPUTE_SHADER_READ_WRITE},
+            {buffers.opacity_raw.deviceBuffer, COMPUTE_SHADER_READ_WRITE},
+            {buffers.tiles_touched.deviceBuffer, COMPUTE_SHADER_WRITE},
+            {buffers.v_xy_vs.deviceBuffer, COMPUTE_SHADER_WRITE},
+            {buffers.v_inv_cov_vs_opacity.deviceBuffer, COMPUTE_SHADER_WRITE},
+            {buffers.v_rgb.deviceBuffer, COMPUTE_SHADER_WRITE},
+        },
+        COMPUTE_SHADER_READ);
+
+    // Adam moments persist across steps; zero them only on the first iteration.
+    _VulkanBuffer* g_xyz;
+    _VulkanBuffer* g_sh0;
+    _VulkanBuffer* g_rot;
+    _VulkanBuffer* g_sc;
+    _VulkanBuffer* g_op;
+    if (uniforms.step <= 1) {
+        g_xyz = &clearDeviceBuffer(buffers.g_xyz_ws, 6 * N);
+        g_sh0 = &clearDeviceBuffer(buffers.g_sh0, 6 * N);
+        g_rot = &clearDeviceBuffer(buffers.g_rotations, 8 * N);
+        g_sc = &clearDeviceBuffer(buffers.g_scaling, 6 * N);
+        g_op = &clearDeviceBuffer(buffers.g_opacity, 2 * N);
+        bufferMemoryBarrier(
+            {
+                {*g_xyz, TRANSFER_COMPUTE_SHADER_WRITE},
+                {*g_sh0, TRANSFER_COMPUTE_SHADER_WRITE},
+                {*g_rot, TRANSFER_COMPUTE_SHADER_WRITE},
+                {*g_sc, TRANSFER_COMPUTE_SHADER_WRITE},
+                {*g_op, TRANSFER_COMPUTE_SHADER_WRITE},
+            },
+            COMPUTE_SHADER_READ_WRITE);
+    } else {
+        g_xyz = &resizeDeviceBuffer(buffers.g_xyz_ws, 6 * N);
+        g_sh0 = &resizeDeviceBuffer(buffers.g_sh0, 6 * N);
+        g_rot = &resizeDeviceBuffer(buffers.g_rotations, 8 * N);
+        g_sc = &resizeDeviceBuffer(buffers.g_scaling, 6 * N);
+        g_op = &resizeDeviceBuffer(buffers.g_opacity, 2 * N);
+    }
+
+    executeCompute(
+        {{N, SUBGROUP_SIZE}},
+        &uniforms, sizeof(uniforms),
+        pipeline_fused_projection_backward_optimizer_split,
+        std::vector<_VulkanBuffer>({
+            buffers.xyz_ws.deviceBuffer,               // 0  means_raw  RW
+            buffers.sh0.deviceBuffer,                  // 1  sh0        RW
+            buffers.shN.deviceBuffer,                  // 2  shN        RO
+            buffers.rotations.deviceBuffer,            // 3  quat       RW
+            buffers.scaling_raw.deviceBuffer,          // 4  log        RW
+            buffers.opacity_raw.deviceBuffer,          // 5  logit      RW
+            buffers.tiles_touched.deviceBuffer,        // 6
+            buffers.v_xy_vs.deviceBuffer,              // 7
+            buffers.v_inv_cov_vs_opacity.deviceBuffer, // 8
+            buffers.v_rgb.deviceBuffer,                // 9
+            *g_xyz,                                    // 10
+            *g_sh0,                                    // 11
+            *g_rot,                                    // 12
+            *g_sc,                                     // 13
+            *g_op,                                     // 14
+        }));
 }
 
 void VulkanGSRenderer::executeSelectionMask(

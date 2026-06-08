@@ -69,6 +69,35 @@ PACK_STRUCT(struct VulkanGSSelectionPolygonRasterizeUniforms {
     uint32_t pad2;
 });
 
+// Matches ShaderUniforms in fused_projection_backward_optimizer_split.slang (160 B).
+// Field order/packing must stay in lockstep with the shader.
+PACK_STRUCT(struct FusedSplitOptimizerUniforms {
+    uint32_t step;       // 1-based iteration (Adam bias correction)
+    uint32_t active_sh;  // low byte = sh degree, high byte = camera model
+    uint32_t num_splats;
+    uint32_t image_size; // hi16 = height, lo16 = width
+    uint32_t shN_slots_per_primitive;
+    uint32_t pad0;
+    uint32_t pad1;
+    uint32_t pad2;
+    float fx;
+    float fy;
+    float cx;
+    float cy;
+    float dist_coeffs[4];
+    float lr_means;
+    float lr_quats;
+    float lr_scales;
+    float lr_opacities;
+    float lr_sh_dc;
+    float reg_scale;
+    float reg_opacity;
+    float pad3;
+    float world_view_transform[16];
+});
+static_assert(sizeof(FusedSplitOptimizerUniforms) == 160,
+              "FusedSplitOptimizerUniforms must match the shader's 160-byte layout");
+
 class VulkanGSRenderer : public VulkanGSPipeline {
 public:
     struct PrimitiveVisibilityStats {
@@ -179,6 +208,17 @@ protected:
                                         const _VulkanBuffer& overlay_params,
                                         bool overlays_active);
 
+    // --- backward / training (no-CUDA Vulkan path) ---
+    // Per-pixel blending backward: scatters dL/d(pixel) into screen-space gradients
+    // (v_xy_vs, v_inv_cov_vs_opacity, v_rgb). Requires v_current_pixel_state populated.
+    void executeRasterizeBackward(const VulkanGSRendererUniforms& uniforms,
+                                  VulkanGSPipelineBuffers& buffers);
+    // Split-raw projection backward + fused Adam: consumes the screen-space gradients
+    // and updates the SplatData raw param buffers in place. Moments persist; pass
+    // step==1 to zero them on the first iteration.
+    void executeFusedProjectionBackwardOptimizerSplit(
+        const FusedSplitOptimizerUniforms& uniforms, VulkanGSPipelineBuffers& buffers);
+
     _ComputePipeline pipeline_projection_forward = _ComputePipeline(19);
     _ComputePipeline pipeline_projection_forward_3dgut = _ComputePipeline(19);
     _ComputePipeline pipeline_selection_mask = _ComputePipeline(9);
@@ -206,6 +246,10 @@ protected:
     _ComputePipelinePair pipeline_rasterize_forward_batches_plain = _ComputePipelinePair(7);
     _ComputePipeline pipeline_compose_tile_batches = _ComputePipeline(17);
     _ComputePipeline pipeline_compose_tile_batches_plain = _ComputePipeline(12);
+    // backward / training: per-pixel blending backward (11 bindings, ping-pong on the
+    // sort slot) + split-raw projection-backward+Adam (15 bindings).
+    _ComputePipelinePair pipeline_rasterize_backward_per_pixel = _ComputePipelinePair(11);
+    _ComputePipeline pipeline_fused_projection_backward_optimizer_split = _ComputePipeline(15);
     struct _CumsumComputePipeline {
         _ComputePipeline single_pass = _ComputePipeline(2);
         _ComputePipeline block_scan = _ComputePipeline(3);

@@ -148,6 +148,20 @@ struct VulkanGSPipelineBuffers {
     Buffer<float> pixel_depth;                 // (H, W, 1), median view-space depth
     Buffer<int32_t> n_contributors;            // (H, W, 1)
 
+    // --- backward / training (no-CUDA Vulkan path) ---
+    // Screen-space gradients: blending-backward outputs == projection-backward inputs.
+    Buffer<float> v_xy_vs;               // (N, 2)
+    Buffer<float> v_inv_cov_vs_opacity;  // (N, 4)
+    Buffer<float> v_rgb;                 // (N, 3)
+    Buffer<float> v_current_pixel_state; // (H, W, 4) upstream dL/d(pixel RGBA)
+    // Adam moments in raw-param space. float buffers use stride-2 float3 packing
+    // (m at slot 0, v at slot 1); the float4-read buffer uses 2 float4 slots/primitive.
+    Buffer<float> g_xyz_ws;    // 2*3*N
+    Buffer<float> g_sh0;       // 2*3*N
+    Buffer<float> g_rotations; // 2*4*N (shader reads as RWStructuredBuffer<float4>)
+    Buffer<float> g_scaling;   // 2*3*N
+    Buffer<float> g_opacity;   // 2*1*N
+
     // intermediate buffers
     Buffer<int32_t> _cumsum_blockSums;
     Buffer<int32_t> _cumsum_blockSums2;
