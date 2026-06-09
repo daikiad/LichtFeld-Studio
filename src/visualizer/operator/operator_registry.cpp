@@ -6,6 +6,7 @@
 #include "control/command_api.hpp"
 #include "core/event_bridge/command_center_bridge.hpp"
 #include "core/logger.hpp"
+#include "core/process_singleton.hpp"
 #include "python/python_runtime.hpp"
 #include "scene/scene_manager.hpp"
 #include "visualizer/operation/undo_history.hpp"
@@ -83,8 +84,15 @@ namespace lfs::vis::op {
     } // namespace
 
     OperatorRegistry& OperatorRegistry::instance() {
-        static OperatorRegistry registry;
-        return registry;
+        // lfs_visualizer is statically linked into BOTH the executable and the lichtfeld Python
+        // extension on macOS, so a plain Meyers singleton here yields two registries: operators
+        // registered from Python (lf.register_class, running in the extension) landed in one copy
+        // while the GUI menu bar queried the other -> "Operator not found". Route the instance
+        // through the shared lfs_core slot so both copies resolve to a single registry.
+        static OperatorRegistry local;
+        static auto* shared = static_cast<OperatorRegistry*>(
+            lfs::core::process_singleton_get_or_set("lfs.vis.operator_registry", &local));
+        return *shared;
     }
 
     void OperatorRegistry::registerOperator(BuiltinOp op, OperatorDescriptor desc, OperatorFactory factory) {

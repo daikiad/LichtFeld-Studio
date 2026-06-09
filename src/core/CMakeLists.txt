@@ -73,6 +73,7 @@ set(CORE_SOURCES
         image_io.cpp
         parameters.cpp
         property_registry.cpp
+        process_singleton.cpp
         reactive_store.cpp
         scene.cpp
         splat_simplify.cpp
