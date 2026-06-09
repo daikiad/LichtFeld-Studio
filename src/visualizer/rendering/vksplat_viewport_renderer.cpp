@@ -3769,6 +3769,7 @@ namespace lfs::vis {
             ou.lr_scales = 5.0e-3f;
             ou.lr_opacities = 5.0e-2f;
             ou.lr_sh_dc = 2.5e-3f;
+            ou.lr_sh_rest = 1.25e-4f; // 3DGS convention: SH DC lr / 20
             ou.reg_scale = 0.0f;
             ou.reg_opacity = 0.0f;
 

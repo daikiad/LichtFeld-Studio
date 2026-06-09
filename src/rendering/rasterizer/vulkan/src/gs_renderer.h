@@ -92,7 +92,7 @@ PACK_STRUCT(struct FusedSplitOptimizerUniforms {
     float lr_sh_dc;
     float reg_scale;
     float reg_opacity;
-    float pad3;
+    float lr_sh_rest;
     float world_view_transform[16];
 });
 static_assert(sizeof(FusedSplitOptimizerUniforms) == 160,
@@ -249,7 +249,7 @@ protected:
     // backward / training: per-pixel blending backward (11 bindings, ping-pong on the
     // sort slot) + split-raw projection-backward+Adam (15 bindings).
     _ComputePipelinePair pipeline_rasterize_backward_per_pixel = _ComputePipelinePair(11);
-    _ComputePipeline pipeline_fused_projection_backward_optimizer_split = _ComputePipeline(15);
+    _ComputePipeline pipeline_fused_projection_backward_optimizer_split = _ComputePipeline(17);
     struct _CumsumComputePipeline {
         _ComputePipeline single_pass = _ComputePipeline(2);
         _ComputePipeline block_scan = _ComputePipeline(3);

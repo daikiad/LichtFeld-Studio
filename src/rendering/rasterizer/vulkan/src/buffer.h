@@ -161,6 +161,8 @@ struct VulkanGSPipelineBuffers {
     Buffer<float> g_rotations; // 2*4*N (shader reads as RWStructuredBuffer<float4>)
     Buffer<float> g_scaling;   // 2*3*N
     Buffer<float> g_opacity;   // 2*1*N
+    Buffer<float> g_shN_1;     // shN moments (m), swizzled float4 layout, = shN float count
+    Buffer<float> g_shN_2;     // shN moments (v), swizzled float4 layout, = shN float count
 
     // intermediate buffers
     Buffer<int32_t> _cumsum_blockSums;

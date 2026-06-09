@@ -750,7 +750,7 @@ void VulkanGSRenderer::executeFusedProjectionBackwardOptimizerSplit(
         {
             {buffers.xyz_ws.deviceBuffer, COMPUTE_SHADER_READ_WRITE},
             {buffers.sh0.deviceBuffer, COMPUTE_SHADER_READ_WRITE},
-            {buffers.shN.deviceBuffer, COMPUTE_SHADER_WRITE},
+            {buffers.shN.deviceBuffer, COMPUTE_SHADER_READ_WRITE},
             {buffers.rotations.deviceBuffer, COMPUTE_SHADER_READ_WRITE},
             {buffers.scaling_raw.deviceBuffer, COMPUTE_SHADER_READ_WRITE},
             {buffers.opacity_raw.deviceBuffer, COMPUTE_SHADER_READ_WRITE},
@@ -761,18 +761,25 @@ void VulkanGSRenderer::executeFusedProjectionBackwardOptimizerSplit(
         },
         COMPUTE_SHADER_READ);
 
+    // shN moment buffers match shN's swizzled float count.
+    const size_t shN_floats = buffers.shN.deviceBuffer.size / sizeof(float);
+
     // Adam moments persist across steps; zero them only on the first iteration.
     _VulkanBuffer* g_xyz;
     _VulkanBuffer* g_sh0;
     _VulkanBuffer* g_rot;
     _VulkanBuffer* g_sc;
     _VulkanBuffer* g_op;
+    _VulkanBuffer* g_shn1;
+    _VulkanBuffer* g_shn2;
     if (uniforms.step <= 1) {
         g_xyz = &clearDeviceBuffer(buffers.g_xyz_ws, 6 * N);
         g_sh0 = &clearDeviceBuffer(buffers.g_sh0, 6 * N);
         g_rot = &clearDeviceBuffer(buffers.g_rotations, 8 * N);
         g_sc = &clearDeviceBuffer(buffers.g_scaling, 6 * N);
         g_op = &clearDeviceBuffer(buffers.g_opacity, 2 * N);
+        g_shn1 = &clearDeviceBuffer(buffers.g_shN_1, std::max<size_t>(shN_floats, 4));
+        g_shn2 = &clearDeviceBuffer(buffers.g_shN_2, std::max<size_t>(shN_floats, 4));
         bufferMemoryBarrier(
             {
                 {*g_xyz, TRANSFER_COMPUTE_SHADER_WRITE},
@@ -780,6 +787,8 @@ void VulkanGSRenderer::executeFusedProjectionBackwardOptimizerSplit(
                 {*g_rot, TRANSFER_COMPUTE_SHADER_WRITE},
                 {*g_sc, TRANSFER_COMPUTE_SHADER_WRITE},
                 {*g_op, TRANSFER_COMPUTE_SHADER_WRITE},
+                {*g_shn1, TRANSFER_COMPUTE_SHADER_WRITE},
+                {*g_shn2, TRANSFER_COMPUTE_SHADER_WRITE},
             },
             COMPUTE_SHADER_READ_WRITE);
     } else {
@@ -788,6 +797,8 @@ void VulkanGSRenderer::executeFusedProjectionBackwardOptimizerSplit(
         g_rot = &resizeDeviceBuffer(buffers.g_rotations, 8 * N);
         g_sc = &resizeDeviceBuffer(buffers.g_scaling, 6 * N);
         g_op = &resizeDeviceBuffer(buffers.g_opacity, 2 * N);
+        g_shn1 = &resizeDeviceBuffer(buffers.g_shN_1, std::max<size_t>(shN_floats, 4));
+        g_shn2 = &resizeDeviceBuffer(buffers.g_shN_2, std::max<size_t>(shN_floats, 4));
     }
 
     executeCompute(
@@ -797,7 +808,7 @@ void VulkanGSRenderer::executeFusedProjectionBackwardOptimizerSplit(
         std::vector<_VulkanBuffer>({
             buffers.xyz_ws.deviceBuffer,               // 0  means_raw  RW
             buffers.sh0.deviceBuffer,                  // 1  sh0        RW
-            buffers.shN.deviceBuffer,                  // 2  shN        RO
+            buffers.shN.deviceBuffer,                  // 2  shN        RW
             buffers.rotations.deviceBuffer,            // 3  quat       RW
             buffers.scaling_raw.deviceBuffer,          // 4  log        RW
             buffers.opacity_raw.deviceBuffer,          // 5  logit      RW
@@ -810,6 +821,8 @@ void VulkanGSRenderer::executeFusedProjectionBackwardOptimizerSplit(
             *g_rot,                                    // 12
             *g_sc,                                     // 13
             *g_op,                                     // 14
+            *g_shn1,                                   // 15
+            *g_shn2,                                   // 16
         }));
 }
 

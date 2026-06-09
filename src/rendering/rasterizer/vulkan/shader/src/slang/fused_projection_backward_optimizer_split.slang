@@ -19,7 +19,7 @@ import strategy_utils;
 // --- Split raw parameter buffers (updated in place by Adam) ---
 layout(binding = 0) RWStructuredBuffer<float> xyz_ws;      // means_raw  [N,3]
 layout(binding = 1) RWStructuredBuffer<float> sh0;         // SH DC      [N,1,3]
-layout(binding = 2) StructuredBuffer<float4> shN;          // SH rest, swizzled (read-only here)
+layout(binding = 2) RWStructuredBuffer<float4> shN;        // SH rest, swizzled (read + Adam update)
 layout(binding = 3) RWStructuredBuffer<float4> rotations;  // raw quat   [N,4]
 layout(binding = 4) RWStructuredBuffer<float> scaling_raw; // log        [N,3]
 layout(binding = 5) RWStructuredBuffer<float> opacity_raw; // logit      [N,1]
@@ -37,6 +37,10 @@ layout(binding = 11) RWStructuredBuffer<float> g_sh0;        // 2*3
 layout(binding = 12) RWStructuredBuffer<float4> g_rotations; // 2 (m,v)
 layout(binding = 13) RWStructuredBuffer<float> g_scaling;    // 2*3
 layout(binding = 14) RWStructuredBuffer<float> g_opacity;    // 2
+// shN rest-coefficient Adam moments, in the SAME swizzled float4 layout as shN
+// (shN_slots_per_primitive slots per primitive). g1 then g2, each a full shN-sized run.
+layout(binding = 15) RWStructuredBuffer<float4> g_shN_1;
+layout(binding = 16) RWStructuredBuffer<float4> g_shN_2;
 
 typedef vector<float, 1> float1;
 
@@ -78,7 +82,7 @@ struct ShaderUniforms {
     float lr_sh_dc;
     float reg_scale;
     float reg_opacity;
-    float pad3;
+    float lr_sh_rest;
     float4x4 world_view_transform;
 };
 
@@ -199,8 +203,50 @@ struct ShaderUniforms {
         write_mean(v, g_idx, g_sh0, 2, 1);
     }
 
-    // TODO(macos-training Phase 1b): optimize the shN rest coefficients. They live in
-    // the swizzled shN buffer (shN_slots_per_primitive float4 slots, SH_REORDER_SIZE
-    // interleave); the gradient is in v_gauss.d.sh_coeffs.coeff1..coeff15. Needs its
-    // own swizzled Adam moment buffers, mirroring the packed sibling's SH loop.
+    // SH rest coefficients (raw), updated in place in the swizzled shN layout.
+    // The 15 rest coeffs (45 floats) are densely packed into float4 slots exactly as
+    // read_spherical_harmonics_coeffs_split unpacks them; mirror that mapping here.
+    if (uniforms.shN_slots_per_primitive > 0u) {
+        float3 c[15];
+        c[0] = v_gauss.d.sh_coeffs.coeff1;
+        c[1] = v_gauss.d.sh_coeffs.coeff2;
+        c[2] = v_gauss.d.sh_coeffs.coeff3;
+        c[3] = v_gauss.d.sh_coeffs.coeff4;
+        c[4] = v_gauss.d.sh_coeffs.coeff5;
+        c[5] = v_gauss.d.sh_coeffs.coeff6;
+        c[6] = v_gauss.d.sh_coeffs.coeff7;
+        c[7] = v_gauss.d.sh_coeffs.coeff8;
+        c[8] = v_gauss.d.sh_coeffs.coeff9;
+        c[9] = v_gauss.d.sh_coeffs.coeff10;
+        c[10] = v_gauss.d.sh_coeffs.coeff11;
+        c[11] = v_gauss.d.sh_coeffs.coeff12;
+        c[12] = v_gauss.d.sh_coeffs.coeff13;
+        c[13] = v_gauss.d.sh_coeffs.coeff14;
+        c[14] = v_gauss.d.sh_coeffs.coeff15;
+
+#if SH_REORDER_SIZE > 1
+        const uint sh_base = (g_idx / SH_REORDER_SIZE) * (uniforms.shN_slots_per_primitive * SH_REORDER_SIZE);
+        const uint sh_off = g_idx % SH_REORDER_SIZE;
+#else
+        const uint sh_base = uniforms.shN_slots_per_primitive * g_idx;
+        const uint sh_off = 0u;
+#endif
+        for (uint s = 0u; s < uniforms.shN_slots_per_primitive; ++s) {
+            const uint f = 4u * s; // first rest-float index of this float4 slot
+            float4 grad = is_zero_grad ? float4(0.0) : float4(
+                (f + 0u) < 45u ? c[(f + 0u) / 3u][(f + 0u) % 3u] : 0.0,
+                (f + 1u) < 45u ? c[(f + 1u) / 3u][(f + 1u) % 3u] : 0.0,
+                (f + 2u) < 45u ? c[(f + 2u) / 3u][(f + 2u) % 3u] : 0.0,
+                (f + 3u) < 45u ? c[(f + 3u) / 3u][(f + 3u) % 3u] : 0.0);
+
+            const uint idx = sh_base + SH_REORDER_SIZE * s + sh_off;
+            float4 x = shN[idx];
+            float4 m = g_shN_1[idx];
+            float4 v = g_shN_2[idx];
+            optimizer_update(x, grad, m, v, uniforms.step, float4(uniforms.lr_sh_rest));
+            shN[idx] = x;
+            g_shN_1[idx] = m;
+            g_shN_2[idx] = v;
+        }
+    }
 }
