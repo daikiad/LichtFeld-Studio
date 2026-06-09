@@ -242,6 +242,7 @@ namespace lfs::vis {
                  (root / "generated/rasterize_backward_per_pixel.spv").string()},
                 {"fused_projection_backward_optimizer_split",
                  (root / "generated/fused_projection_backward_optimizer_split.spv").string()},
+                {"l1_grad", (root / "generated/l1_grad.spv").string()},
                 {"cumsum_single_pass", (root / "generated/cumsum_single_pass.spv").string()},
                 {"cumsum_block_scan", (root / "generated/cumsum_block_scan.spv").string()},
                 {"cumsum_scan_block_sums", (root / "generated/cumsum_scan_block_sums.spv").string()},
@@ -3689,11 +3690,18 @@ namespace lfs::vis {
         int iters) {
         using lfs::core::Tensor;
 
+        // Force an opaque black background: the GPU L1 loss reads the raster accumulator
+        // (pixel_state) and treats the composed image as clamp(pixel_state.rgb), which is
+        // exact only when T*background == 0.
+        lfs::rendering::ViewportRenderRequest req = request;
+        req.transparent_background = false;
+        req.frame_view.background_color = glm::vec3(0.0f);
+
         // Prime all ring slots with the original model so the training loop can render
         // with force_input_upload=false and the optimizer's in-place param updates are
         // not clobbered by a re-upload (see the ring-slot note in the design memory).
         for (int w = 0; w < static_cast<int>(kInputRingSize) + 1; ++w) {
-            auto r = render(context, splat_data, request, /*force_input_upload=*/true,
+            auto r = render(context, splat_data, req, /*force_input_upload=*/true,
                             OutputSlot::Main, /*synchronize_input_upload=*/false);
             if (!r) {
                 return std::unexpected("self-test prime render failed: " + r.error());
@@ -3707,48 +3715,39 @@ namespace lfs::vis {
         }
 
         // Ground truth = the current render darkened by 0.5 (a learnable target the model
-        // can reach by lowering its SH DC / opacity).
+        // can reach by lowering its SH DC / opacity). Upload once to the device GT buffer
+        // as float4 (rgb, 0) so the loss gradient runs entirely on the GPU each step.
         auto gt_img = readOutputImageRgb8(context, OutputSlot::Main);
         if (!gt_img || !*gt_img || !(*gt_img)->is_valid()) {
             return std::unexpected("self-test ground-truth readback failed");
         }
-        std::vector<float> gt(3 * P);
+        std::vector<float> gt4(4 * P, 0.0f);
         {
             const std::uint8_t* g = (*gt_img)->ptr<std::uint8_t>();
-            for (std::size_t i = 0; i < 3 * P; ++i) {
-                gt[i] = (g[i] / 255.0f) * 0.5f;
+            for (std::size_t p = 0; p < P; ++p) {
+                gt4[4 * p + 0] = (g[3 * p + 0] / 255.0f) * 0.5f;
+                gt4[4 * p + 1] = (g[3 * p + 1] / 255.0f) * 0.5f;
+                gt4[4 * p + 2] = (g[3 * p + 2] / 255.0f) * 0.5f;
             }
         }
+        {
+            auto& gtbuf = renderer_.resizeDeviceBuffer(buffers_.train_gt, 4 * P);
+            renderer_.uploadHostBufferToDevice(gtbuf, gt4.data(), 4 * P * sizeof(float));
+        }
 
-        LOG_WARN("vk-train self-test: N={} splats, image={}x{}, {} iters (target = render * 0.5)",
+        LOG_WARN("vk-train self-test: N={} splats, image={}x{}, {} iters, GPU L1 (target = render * 0.5)",
                  buffers_.num_splats, W, H, iters);
 
-        std::vector<float> v(4 * P, 0.0f);
-        const float inv = 1.0f / static_cast<float>(3 * P);
+        L1GradUniforms lu{};
+        lu.num_pixels = static_cast<std::uint32_t>(P);
+        lu.inv_scale = 1.0f / static_cast<float>(3 * P);
+
         for (int step = 1; step <= iters; ++step) {
-            auto r = render(context, splat_data, request, /*force_input_upload=*/false,
+            auto r = render(context, splat_data, req, /*force_input_upload=*/false,
                             OutputSlot::Main, /*synchronize_input_upload=*/false);
             if (!r) {
                 return std::unexpected("self-test render failed: " + r.error());
             }
-            auto cur = readOutputImageRgb8(context, OutputSlot::Main);
-            if (!cur || !*cur || !(*cur)->is_valid()) {
-                return std::unexpected("self-test readback failed");
-            }
-            const std::uint8_t* c = (*cur)->ptr<std::uint8_t>();
-
-            // CPU mean-L1 loss + gradient dL/d(pixel) = sign(render - gt)/(3P); alpha 0.
-            double l1 = 0.0;
-            std::fill(v.begin(), v.end(), 0.0f);
-            for (std::size_t p = 0; p < P; ++p) {
-                for (int ch = 0; ch < 3; ++ch) {
-                    const float rr = c[3 * p + ch] / 255.0f;
-                    const float d = rr - gt[3 * p + ch];
-                    l1 += std::abs(d);
-                    v[4 * p + ch] = (d > 0.0f ? 1.0f : (d < 0.0f ? -1.0f : 0.0f)) * inv;
-                }
-            }
-            l1 /= static_cast<double>(3 * P);
 
             FusedSplitOptimizerUniforms ou{};
             ou.step = static_cast<std::uint32_t>(step);
@@ -3773,13 +3772,24 @@ namespace lfs::vis {
             ou.reg_scale = 0.0f;
             ou.reg_opacity = 0.0f;
 
-            const std::size_t pix_floats = 4 * P;
-            auto& vbuf = renderer_.resizeDeviceBuffer(buffers_.v_current_pixel_state, pix_floats);
-            renderer_.uploadHostBufferToDevice(vbuf, v.data(), pix_floats * sizeof(float));
+            // GPU loss gradient (no per-iteration CPU readback) -> backward -> Adam.
+            renderer_.executeL1LossGradient(lu, buffers_);
             renderer_.executeRasterizeBackward(last_uniforms_, buffers_);
             renderer_.executeFusedProjectionBackwardOptimizerSplit(ou, buffers_);
 
-            LOG_WARN("vk-train step {:3d}  L1={:.6f}", step, l1);
+            // Occasional CPU loss readback purely for logging.
+            if (step == 1 || step % 10 == 0 || step == iters) {
+                auto cur = readOutputImageRgb8(context, OutputSlot::Main);
+                if (cur && *cur && (*cur)->is_valid()) {
+                    const std::uint8_t* c = (*cur)->ptr<std::uint8_t>();
+                    double l1 = 0.0;
+                    for (std::size_t p = 0; p < P; ++p)
+                        for (int ch = 0; ch < 3; ++ch)
+                            l1 += std::abs(c[3 * p + ch] / 255.0f - gt4[4 * p + ch]);
+                    l1 /= static_cast<double>(3 * P);
+                    LOG_WARN("vk-train step {:3d}  L1={:.6f}", step, l1);
+                }
+            }
         }
         return {};
     }

@@ -169,6 +169,7 @@ _vulkan_add_slang_shader(rasterize_backward_per_pixel         alphablend_shader.
 _vulkan_add_slang_shader(rasterize_backward_tensor            alphablend_shader.slang EXPORT_MODE=1 BACKWARD_MODE=2)
 _vulkan_add_slang_shader(ssim_forward                         ssim.slang EXPORT_MODE=0)
 _vulkan_add_slang_shader(ssim_backward                        ssim.slang EXPORT_MODE=1)
+_vulkan_add_slang_shader(l1_grad                              l1_grad.slang)
 
 # selection_mask.slang → compact 1-byte-per-splat brush/rectangle/polygon masks
 _vulkan_add_slang_shader(selection_mask            selection_mask.slang)

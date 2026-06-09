@@ -154,6 +154,7 @@ struct VulkanGSPipelineBuffers {
     Buffer<float> v_inv_cov_vs_opacity;  // (N, 4)
     Buffer<float> v_rgb;                 // (N, 3)
     Buffer<float> v_current_pixel_state; // (H, W, 4) upstream dL/d(pixel RGBA)
+    Buffer<float> train_gt;             // (H, W, 4) ground-truth image for the GPU loss
     // Adam moments in raw-param space. float buffers use stride-2 float3 packing
     // (m at slot 0, v at slot 1); the float4-read buffer uses 2 float4 slots/primitive.
     Buffer<float> g_xyz_ws;    // 2*3*N

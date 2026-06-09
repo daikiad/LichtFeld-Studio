@@ -246,6 +246,9 @@ void VulkanGSRenderer::initializeExternal(const std::map<std::string, std::strin
         createComputePipeline(pipeline_fused_projection_backward_optimizer_split,
                               spirv_paths.at("fused_projection_backward_optimizer_split"));
     }
+    if (spirv_paths.count("l1_grad")) {
+        createComputePipeline(pipeline_l1_grad, spirv_paths.at("l1_grad"));
+    }
     createComputePipeline(pipeline_cumsum.single_pass, spirv_paths.at("cumsum_single_pass"));
     createComputePipeline(pipeline_cumsum.block_scan, spirv_paths.at("cumsum_block_scan"));
     createComputePipeline(pipeline_cumsum.scan_block_sums, spirv_paths.at("cumsum_scan_block_sums"));
@@ -823,6 +826,27 @@ void VulkanGSRenderer::executeFusedProjectionBackwardOptimizerSplit(
             *g_op,                                     // 14
             *g_shn1,                                   // 15
             *g_shn2,                                   // 16
+        }));
+}
+
+void VulkanGSRenderer::executeL1LossGradient(
+    const L1GradUniforms& uniforms, VulkanGSPipelineBuffers& buffers) {
+    DEVICE_GUARD;
+    bufferMemoryBarrier(
+        {
+            {buffers.pixel_state.deviceBuffer, COMPUTE_SHADER_WRITE},
+            {buffers.train_gt.deviceBuffer, TRANSFER_COMPUTE_SHADER_WRITE},
+        },
+        COMPUTE_SHADER_READ);
+    auto& v_out = resizeDeviceBuffer(buffers.v_current_pixel_state, 4 * uniforms.num_pixels);
+    executeCompute(
+        {{uniforms.num_pixels, 256}},
+        &uniforms, sizeof(uniforms),
+        pipeline_l1_grad,
+        std::vector<_VulkanBuffer>({
+            buffers.pixel_state.deviceBuffer, // 0  rendered accumulator
+            buffers.train_gt.deviceBuffer,    // 1  ground truth
+            v_out,                            // 2  out: dL/d(pixel_state)
         }));
 }
 

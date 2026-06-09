@@ -98,6 +98,14 @@ PACK_STRUCT(struct FusedSplitOptimizerUniforms {
 static_assert(sizeof(FusedSplitOptimizerUniforms) == 160,
               "FusedSplitOptimizerUniforms must match the shader's 160-byte layout");
 
+// Matches Uniforms in l1_grad.slang.
+PACK_STRUCT(struct L1GradUniforms {
+    uint32_t num_pixels;
+    float inv_scale; // 1 / (3 * num_pixels) for mean-L1
+    uint32_t pad0;
+    uint32_t pad1;
+});
+
 class VulkanGSRenderer : public VulkanGSPipeline {
 public:
     struct PrimitiveVisibilityStats {
@@ -188,6 +196,9 @@ public:
     // step==1 to zero them on the first iteration.
     void executeFusedProjectionBackwardOptimizerSplit(
         const FusedSplitOptimizerUniforms& uniforms, VulkanGSPipelineBuffers& buffers);
+    // GPU image-space L1 loss gradient: reads pixel_state + buffers.train_gt, writes
+    // v_current_pixel_state (no per-iteration CPU readback).
+    void executeL1LossGradient(const L1GradUniforms& uniforms, VulkanGSPipelineBuffers& buffers);
 
 protected:
     void executeCumsum(
@@ -250,6 +261,7 @@ protected:
     // sort slot) + split-raw projection-backward+Adam (15 bindings).
     _ComputePipelinePair pipeline_rasterize_backward_per_pixel = _ComputePipelinePair(11);
     _ComputePipeline pipeline_fused_projection_backward_optimizer_split = _ComputePipeline(17);
+    _ComputePipeline pipeline_l1_grad = _ComputePipeline(3);
     struct _CumsumComputePipeline {
         _ComputePipeline single_pass = _ComputePipeline(2);
         _ComputePipeline block_scan = _ComputePipeline(3);
