@@ -27,7 +27,12 @@ class ImportDatasetOperator(Operator):
     def execute(self, context) -> set:
         path = lf.ui.open_dataset_folder_dialog()
         if path:
-            open_dataset_import_panel(path)
+            # Load the dataset directly (mirrors ImportPlyOperator). The retained config
+            # panel (open_dataset_import_panel) is not instantiated on this build, so going
+            # straight through lf.load_file is the reliable path: it loads cameras + point
+            # cloud for viewing (and, on CUDA builds, sets up training).
+            register_catalog_asset_path(path, is_dataset=True, select=True)
+            lf.load_file(path, is_dataset=True)
         return {"FINISHED"}
 
 

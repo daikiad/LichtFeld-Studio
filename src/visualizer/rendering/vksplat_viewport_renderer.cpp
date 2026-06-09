@@ -3814,199 +3814,190 @@ namespace lfs::vis {
         return r ? buffers_.num_indices : 0;
     }
 
-    std::expected<void, std::string> VksplatViewportRenderer::runMultiCameraTraining(
-        VulkanContext& context,
-        lfs::core::SplatData& model,
-        const std::vector<lfs::rendering::ViewportRenderRequest>& requests,
-        const std::vector<std::vector<float>>& gts,
-        int iters) {
-        if (requests.empty() || requests.size() != gts.size()) {
-            return std::unexpected("runMultiCameraTraining: empty or mismatched requests/gts");
-        }
-        if (auto init = ensureInitialized(context); !init) {
-            return std::unexpected("runMultiCameraTraining: renderer init failed: " + init.error());
-        }
-
-
-        const std::size_t n_cams = requests.size();
-
-        const auto pixel_count = [&](std::size_t cam) -> std::size_t {
-            return static_cast<std::size_t>(requests[cam].frame_view.size.x) *
-                   static_cast<std::size_t>(requests[cam].frame_view.size.y);
+    void VksplatViewportRenderer::vkTrainWriteBack(VkTrainState& st) {
+        if (!st.model)
+            return;
+        const auto wb = [&](const _VulkanBuffer& dev, lfs::core::Tensor& t) {
+            renderer_.downloadDeviceBufferToHost(dev, t.ptr<float>(),
+                                                 static_cast<std::size_t>(t.numel()) * sizeof(float));
         };
+        wb(buffers_.xyz_ws.deviceBuffer, st.model->means_raw());
+        wb(buffers_.sh0.deviceBuffer, st.model->sh0());
+        wb(buffers_.shN.deviceBuffer, st.model->shN());
+        wb(buffers_.rotations.deviceBuffer, st.model->rotation_raw());
+        wb(buffers_.scaling_raw.deviceBuffer, st.model->scaling_raw());
+        wb(buffers_.opacity_raw.deviceBuffer, st.model->opacity_raw());
+    }
+
+    float VksplatViewportRenderer::vkTrainOutputL1(VulkanContext& context, const VkTrainState& st,
+                                                   std::size_t cam) const {
+        auto cur = readOutputImageRgb8(context, OutputSlot::Main);
+        if (!cur || !*cur || !(*cur)->is_valid())
+            return -1.0f;
+        const std::uint8_t* c = (*cur)->ptr<std::uint8_t>();
+        const auto& req = (*st.requests)[cam];
+        const std::size_t P = static_cast<std::size_t>(req.frame_view.size.x) *
+                              static_cast<std::size_t>(req.frame_view.size.y);
+        const std::vector<float>& gt = (*st.gts)[cam];
+        if (gt.size() < 4 * P)
+            return -1.0f;
+        double l1 = 0.0;
+        for (std::size_t p = 0; p < P; ++p)
+            for (int ch = 0; ch < 3; ++ch)
+                l1 += std::abs(c[3 * p + ch] / 255.0f - gt[4 * p + ch]);
+        return static_cast<float>(l1 / static_cast<double>(3 * P));
+    }
+
+    void VksplatViewportRenderer::vkTrainDensify(VulkanContext& context, VkTrainState& st, int step) {
+        vkTrainWriteBack(st);
+        auto& model = *st.model;
+        const std::size_t N = static_cast<std::size_t>(model.size());
+        if (N == 0)
+            return;
+        auto op_cpu = model.opacity_raw().cpu().contiguous();
+        const float* opp = op_cpu.ptr<float>();
+        std::vector<std::int32_t> keep;
+        keep.reserve(N);
+        std::vector<std::pair<float, std::int32_t>> cand;
+        for (std::size_t i = 0; i < N; ++i) {
+            const float opac = 1.0f / (1.0f + std::exp(-opp[i]));
+            if (opac <= st.min_opacity)
+                continue;
+            keep.push_back(static_cast<std::int32_t>(i));
+            if (i < st.grad_count.size() && st.grad_count[i] > 0)
+                cand.push_back({static_cast<float>(st.grad_accum[i] / st.grad_count[i]), static_cast<std::int32_t>(i)});
+        }
+        if (keep.empty())
+            return;
+        std::size_t want = static_cast<std::size_t>(st.grow_fraction * static_cast<float>(keep.size()));
+        if (keep.size() + want > st.max_cap)
+            want = st.max_cap > keep.size() ? st.max_cap - keep.size() : 0;
+        std::vector<std::int32_t> clone;
+        if (want > 0 && !cand.empty()) {
+            const std::size_t k = std::min(want, cand.size());
+            std::partial_sort(cand.begin(), cand.begin() + k, cand.end(),
+                              [](const auto& a, const auto& b) { return a.first > b.first; });
+            for (std::size_t c = 0; c < k; ++c)
+                clone.push_back(cand[c].second);
+        }
+        const std::size_t new_N = keep.size() + clone.size();
+        // Plain-C++ row gather+clone (avoids index_select/cat device dispatch on host-CUDA tensors).
+        const auto gatherClone = [&](const lfs::core::Tensor& src) -> lfs::core::Tensor {
+            auto s = src.cpu().contiguous();
+            const float* sp = s.ptr<float>();
+            const std::size_t n_old = static_cast<std::size_t>(src.shape()[0]);
+            const std::size_t row = n_old ? static_cast<std::size_t>(src.numel()) / n_old : 0;
+            std::vector<std::size_t> shp;
+            for (std::size_t d = 0; d < src.shape().rank(); ++d)
+                shp.push_back(static_cast<std::size_t>(src.shape()[d]));
+            shp[0] = new_N;
+            lfs::core::Tensor out = lfs::core::Tensor::empty(
+                lfs::core::TensorShape(shp), lfs::core::Device::CPU, lfs::core::DataType::Float32);
+            float* dp = out.ptr<float>();
+            std::size_t j = 0;
+            for (std::int32_t i : keep) {
+                std::memcpy(dp + j * row, sp + static_cast<std::size_t>(i) * row, row * sizeof(float));
+                ++j;
+            }
+            for (std::int32_t i : clone) {
+                std::memcpy(dp + j * row, sp + static_cast<std::size_t>(i) * row, row * sizeof(float));
+                ++j;
+            }
+            return out.to(src.device());
+        };
+        model.means_raw() = gatherClone(model.means_raw());
+        model.sh0() = gatherClone(model.sh0());
+        model.rotation_raw() = gatherClone(model.rotation_raw());
+        model.scaling_raw() = gatherClone(model.scaling_raw());
+        model.opacity_raw() = gatherClone(model.opacity_raw());
+        auto canon = model.shN_canonical_cpu();
+        if (canon.is_valid() && canon.numel() > 0) {
+            auto new_canon = gatherClone(canon);
+            model.shN_set_from_canonical(new_canon, new_N);
+        }
+
+        // Break clone symmetry: offset each cloned copy's position by ~1 sigma (its world
+        // scale = exp(scaling_raw)) in a random direction so the two splats diverge.
+        if (!clone.empty()) {
+            auto m_cpu = model.means_raw().cpu().contiguous();
+            auto s_cpu = model.scaling_raw().cpu().contiguous();
+            float* mp = m_cpu.ptr<float>();
+            const float* scp = s_cpu.ptr<float>();
+            std::mt19937 rng(static_cast<std::uint32_t>(step) * 2654435761u + 12345u);
+            std::uniform_real_distribution<float> uni(-1.0f, 1.0f);
+            for (std::size_t c = 0; c < clone.size(); ++c) {
+                const std::size_t r = keep.size() + c;
+                mp[3 * r + 0] += uni(rng) * std::exp(scp[3 * r + 0]);
+                mp[3 * r + 1] += uni(rng) * std::exp(scp[3 * r + 1]);
+                mp[3 * r + 2] += uni(rng) * std::exp(scp[3 * r + 2]);
+            }
+            model.means_raw() = m_cpu.to(model.means_raw().device());
+        }
+
+        st.grad_accum.assign(new_N, 0.0);
+        st.grad_count.assign(new_N, 0);
+        for (int w = 0; w < static_cast<int>(kInputRingSize) + 1; ++w)
+            (void)render(context, model, (*st.requests)[0], /*force_input_upload=*/true, OutputSlot::Main, false);
+        LOG_WARN("vk-train densify @step {:4d}: {} -> {} splats (kept {}, cloned {})",
+                 step, N, new_N, keep.size(), clone.size());
+    }
+
+    std::expected<void, std::string> VksplatViewportRenderer::vkTrainInit(VulkanContext& context, VkTrainState& st) {
+        if (!st.model)
+            return std::unexpected("vkTrainInit: null model");
+        if (!st.requests || !st.gts)
+            return std::unexpected("vkTrainInit: null requests/gts");
+        if (st.requests->empty() || st.requests->size() != st.gts->size())
+            return std::unexpected("vkTrainInit: empty or mismatched requests/gts");
+        if (auto init = ensureInitialized(context); !init)
+            return std::unexpected("vkTrainInit: renderer init failed: " + init.error());
 
         // Prime all ring slots with the model (camera 0) so subsequent renders with
         // force_input_upload=false keep the optimizer's in-place device updates.
         for (int w = 0; w < static_cast<int>(kInputRingSize) + 1; ++w) {
-            auto r = render(context, model, requests[0], /*force_input_upload=*/true,
+            auto r = render(context, *st.model, (*st.requests)[0], /*force_input_upload=*/true,
                             OutputSlot::Main, /*synchronize_input_upload=*/false);
-            if (!r) {
-                return std::unexpected("multi-cam prime render failed: " + r.error());
-            }
+            if (!r)
+                return std::unexpected("vk-train prime render failed: " + r.error());
         }
-        if (buffers_.num_splats == 0) {
-            return std::unexpected("multi-cam: empty model");
+        if (buffers_.num_splats == 0)
+            return std::unexpected("vk-train: empty model");
+
+        st.grad_accum.assign(buffers_.num_splats, 0.0);
+        st.grad_count.assign(buffers_.num_splats, 0);
+        st.adam_t = 1;
+        st.current_iter = 0;
+        if (st.stop_refine <= 0)
+            st.stop_refine = std::max(st.start_refine, st.total_iters - 50);
+        st.primed = true;
+
+        const float l1 = vkTrainOutputL1(context, st, 0);
+        LOG_WARN("vk-train: {} cameras, {} splats, {} iters, cam0 L1={:.6f} num_indices={}",
+                 st.requests->size(), buffers_.num_splats, st.total_iters, l1, buffers_.num_indices);
+        return {};
+    }
+
+    std::expected<int, std::string> VksplatViewportRenderer::vkTrainStep(VulkanContext& context, VkTrainState& st,
+                                                                         int n_iters) {
+        if (!st.primed) {
+            if (auto r = vkTrainInit(context, st); !r)
+                return std::unexpected(r.error());
         }
+        auto& model = *st.model;
+        const auto& requests = *st.requests;
+        const auto& gts = *st.gts;
+        const std::size_t n_cams = requests.size();
+        const int end = std::min(st.total_iters, st.current_iter + std::max(0, n_iters));
+        int executed = 0;
 
-        // Pose sanity check: L1 of camera 0's initial render vs its GT (high/garbage =>
-        // wrong pose convention; should be moderate for a sensible init).
-        const auto log_l1 = [&](std::size_t cam, int step) {
-            auto cur = readOutputImageRgb8(context, OutputSlot::Main);
-            if (!cur || !*cur || !(*cur)->is_valid())
-                return;
-            const std::uint8_t* c = (*cur)->ptr<std::uint8_t>();
-            const std::size_t P = pixel_count(cam);
-            const std::vector<float>& gt = gts[cam];
-            if (gt.size() < 4 * P)
-                return;
-            double l1 = 0.0;
-            for (std::size_t p = 0; p < P; ++p)
-                for (int ch = 0; ch < 3; ++ch)
-                    l1 += std::abs(c[3 * p + ch] / 255.0f - gt[4 * p + ch]);
-            l1 /= static_cast<double>(3 * P);
-            LOG_WARN("vk-train step {:4d}  cam {:2d}  L1={:.6f}", step, static_cast<int>(cam), l1);
-        };
-        log_l1(0, 0);
-        LOG_WARN("vk-train: cam0 num_indices={} (0 => nothing visible; check pose/intrinsics) "
-                 "wv_t=({:.2f},{:.2f},{:.2f}) fx={:.1f} cx={:.1f} active_sh={} img={}x{}",
-                 buffers_.num_indices,
-                 last_uniforms_.world_view_transform[12], last_uniforms_.world_view_transform[13],
-                 last_uniforms_.world_view_transform[14], last_uniforms_.fx, last_uniforms_.cx,
-                 last_uniforms_.active_sh, last_uniforms_.image_width, last_uniforms_.image_height);
-
-        LOG_WARN("vk-train: {} cameras, {} splats, {} iters", n_cams, buffers_.num_splats, iters);
-
-        // --- Densification (gradient-driven clone + opacity prune) ---
-        // Pull the optimizer-updated device params back into the model's host tensors.
-        const auto syncDeviceToModel = [&]() {
-            const auto wb = [&](const _VulkanBuffer& dev, lfs::core::Tensor& t) {
-                renderer_.downloadDeviceBufferToHost(dev, t.ptr<float>(),
-                                                     static_cast<std::size_t>(t.numel()) * sizeof(float));
-            };
-            wb(buffers_.xyz_ws.deviceBuffer, model.means_raw());
-            wb(buffers_.sh0.deviceBuffer, model.sh0());
-            wb(buffers_.shN.deviceBuffer, model.shN());
-            wb(buffers_.rotations.deviceBuffer, model.rotation_raw());
-            wb(buffers_.scaling_raw.deviceBuffer, model.scaling_raw());
-            wb(buffers_.opacity_raw.deviceBuffer, model.opacity_raw());
-        };
-
-        std::vector<double> grad_accum(buffers_.num_splats, 0.0);
-        std::vector<int> grad_count(buffers_.num_splats, 0);
-        std::vector<float> vxy_host;
-        std::vector<std::int32_t> radii_host;
-        std::uint32_t adam_t = 1;
-        const int refine_every = 100;
-        const int start_refine = 500;
-        const int stop_refine = std::max(start_refine, iters - 50);
-        const std::size_t max_cap = 3'000'000;
-        const float min_opacity = 0.005f;
-        const float grow_fraction = 0.05f;
-
-        // One densify pass: clone top-gradient splats, prune low-opacity, mutate the model
-        // in host/canonical space, then re-prime the device buffers from the new model.
-        const auto densify = [&](int step) {
-            syncDeviceToModel();
-            const std::size_t N = static_cast<std::size_t>(model.size());
-            if (N == 0)
-                return;
-            auto op_cpu = model.opacity_raw().cpu().contiguous();
-            const float* opp = op_cpu.ptr<float>();
-            std::vector<std::int32_t> keep;
-            keep.reserve(N);
-            std::vector<std::pair<float, std::int32_t>> cand;
-            for (std::size_t i = 0; i < N; ++i) {
-                const float opac = 1.0f / (1.0f + std::exp(-opp[i]));
-                if (opac <= min_opacity)
-                    continue;
-                keep.push_back(static_cast<std::int32_t>(i));
-                if (i < grad_count.size() && grad_count[i] > 0)
-                    cand.push_back({static_cast<float>(grad_accum[i] / grad_count[i]), static_cast<std::int32_t>(i)});
-            }
-            if (keep.empty())
-                return;
-            std::size_t want = static_cast<std::size_t>(grow_fraction * static_cast<float>(keep.size()));
-            if (keep.size() + want > max_cap)
-                want = max_cap > keep.size() ? max_cap - keep.size() : 0;
-            std::vector<std::int32_t> clone;
-            if (want > 0 && !cand.empty()) {
-                const std::size_t k = std::min(want, cand.size());
-                std::partial_sort(cand.begin(), cand.begin() + k, cand.end(),
-                                  [](const auto& a, const auto& b) { return a.first > b.first; });
-                for (std::size_t c = 0; c < k; ++c)
-                    clone.push_back(cand[c].second);
-            }
-            const std::size_t new_N = keep.size() + clone.size();
-            // Plain-C++ row gather+clone (avoids index_select/cat device dispatch on host-CUDA tensors).
-            const auto gatherClone = [&](const lfs::core::Tensor& src) -> lfs::core::Tensor {
-                auto s = src.cpu().contiguous();
-                const float* sp = s.ptr<float>();
-                const std::size_t n_old = static_cast<std::size_t>(src.shape()[0]);
-                const std::size_t row = n_old ? static_cast<std::size_t>(src.numel()) / n_old : 0;
-                std::vector<std::size_t> shp;
-                for (std::size_t d = 0; d < src.shape().rank(); ++d)
-                    shp.push_back(static_cast<std::size_t>(src.shape()[d]));
-                shp[0] = new_N;
-                lfs::core::Tensor out = lfs::core::Tensor::empty(
-                    lfs::core::TensorShape(shp), lfs::core::Device::CPU, lfs::core::DataType::Float32);
-                float* dp = out.ptr<float>();
-                std::size_t j = 0;
-                for (std::int32_t i : keep) {
-                    std::memcpy(dp + j * row, sp + static_cast<std::size_t>(i) * row, row * sizeof(float));
-                    ++j;
-                }
-                for (std::int32_t i : clone) {
-                    std::memcpy(dp + j * row, sp + static_cast<std::size_t>(i) * row, row * sizeof(float));
-                    ++j;
-                }
-                return out.to(src.device());
-            };
-            model.means_raw() = gatherClone(model.means_raw());
-            model.sh0() = gatherClone(model.sh0());
-            model.rotation_raw() = gatherClone(model.rotation_raw());
-            model.scaling_raw() = gatherClone(model.scaling_raw());
-            model.opacity_raw() = gatherClone(model.opacity_raw());
-            auto canon = model.shN_canonical_cpu();
-            if (canon.is_valid() && canon.numel() > 0) {
-                auto new_canon = gatherClone(canon);
-                model.shN_set_from_canonical(new_canon, new_N);
-            }
-
-            // Break clone symmetry: offset each cloned copy's position by ~1 sigma (its world
-            // scale = exp(scaling_raw)) in a random direction. Exact duplicates share the same
-            // gradient and never diverge, so without this the clone is a near no-op (and the
-            // doubled density pops). Offsetting lets the two splats fill detail independently.
-            if (!clone.empty()) {
-                auto m_cpu = model.means_raw().cpu().contiguous();
-                auto s_cpu = model.scaling_raw().cpu().contiguous();
-                float* mp = m_cpu.ptr<float>();
-                const float* scp = s_cpu.ptr<float>();
-                std::mt19937 rng(static_cast<std::uint32_t>(step) * 2654435761u + 12345u);
-                std::uniform_real_distribution<float> uni(-1.0f, 1.0f);
-                for (std::size_t c = 0; c < clone.size(); ++c) {
-                    const std::size_t r = keep.size() + c;
-                    mp[3 * r + 0] += uni(rng) * std::exp(scp[3 * r + 0]);
-                    mp[3 * r + 1] += uni(rng) * std::exp(scp[3 * r + 1]);
-                    mp[3 * r + 2] += uni(rng) * std::exp(scp[3 * r + 2]);
-                }
-                model.means_raw() = m_cpu.to(model.means_raw().device());
-            }
-
-            grad_accum.assign(new_N, 0.0);
-            grad_count.assign(new_N, 0);
-            for (int w = 0; w < static_cast<int>(kInputRingSize) + 1; ++w)
-                (void)render(context, model, requests[0], /*force_input_upload=*/true, OutputSlot::Main, false);
-            LOG_WARN("vk-train densify @step {:4d}: {} -> {} splats (kept {}, cloned {})",
-                     step, N, new_N, keep.size(), clone.size());
-        };
-
-        for (int step = 1; step <= iters; ++step) {
+        for (int step = st.current_iter + 1; step <= end; ++step) {
             const std::size_t cam = static_cast<std::size_t>(step - 1) % n_cams;
             auto r = render(context, model, requests[cam], /*force_input_upload=*/false,
                             OutputSlot::Main, /*synchronize_input_upload=*/false);
-            if (!r) {
+            if (!r)
                 return std::unexpected("multi-cam render failed: " + r.error());
-            }
+            st.current_iter = step;
+            ++executed;
             if (buffers_.num_indices == 0) {
                 if (step <= 3 || step % 50 == 0)
                     LOG_WARN("vk-train step {:4d} cam {:2d}: num_indices=0, skipping", step, static_cast<int>(cam));
@@ -4015,9 +4006,8 @@ namespace lfs::vis {
             const std::size_t H = last_uniforms_.image_height;
             const std::size_t W = last_uniforms_.image_width;
             const std::size_t P = H * W;
-            if (gts[cam].size() < 4 * P) {
+            if (gts[cam].size() < 4 * P)
                 return std::unexpected("multi-cam: GT smaller than render");
-            }
 
             // Upload this camera's GT, then GPU loss -> backward -> Adam.
             auto& gtbuf = renderer_.resizeDeviceBuffer(buffers_.train_gt, 4 * P);
@@ -4028,7 +4018,7 @@ namespace lfs::vis {
             lu.inv_scale = 1.0f / static_cast<float>(3 * P);
 
             FusedSplitOptimizerUniforms ou{};
-            ou.step = adam_t; // resets to 1 after densification to re-clear Adam moments at the new N
+            ou.step = st.adam_t; // resets to 1 after densification to re-clear Adam moments at the new N
             ou.active_sh = last_uniforms_.active_sh | (last_uniforms_.camera_model << 8);
             ou.num_splats = static_cast<std::uint32_t>(buffers_.num_splats);
             ou.image_size = (static_cast<std::uint32_t>(H) << 16) | static_cast<std::uint32_t>(W);
@@ -4053,42 +4043,66 @@ namespace lfs::vis {
             renderer_.executeL1LossGradient(lu, buffers_);
             renderer_.executeRasterizeBackward(last_uniforms_, buffers_);
             renderer_.executeFusedProjectionBackwardOptimizerSplit(ou, buffers_);
-            ++adam_t;
+            ++st.adam_t;
 
             // Accumulate the per-gaussian screen-space gradient magnitude (densification stat).
             {
                 const std::size_t Ns = buffers_.num_splats;
-                if (grad_accum.size() != Ns) {
-                    grad_accum.assign(Ns, 0.0);
-                    grad_count.assign(Ns, 0);
+                if (st.grad_accum.size() != Ns) {
+                    st.grad_accum.assign(Ns, 0.0);
+                    st.grad_count.assign(Ns, 0);
                 }
-                vxy_host.resize(2 * Ns);
-                radii_host.resize(Ns);
-                renderer_.downloadDeviceBufferToHost(buffers_.v_xy_vs.deviceBuffer, vxy_host.data(),
+                st.vxy_host.resize(2 * Ns);
+                st.radii_host.resize(Ns);
+                renderer_.downloadDeviceBufferToHost(buffers_.v_xy_vs.deviceBuffer, st.vxy_host.data(),
                                                      2 * Ns * sizeof(float));
-                renderer_.downloadDeviceBufferToHost(buffers_.radii.deviceBuffer, radii_host.data(),
+                renderer_.downloadDeviceBufferToHost(buffers_.radii.deviceBuffer, st.radii_host.data(),
                                                      Ns * sizeof(std::int32_t));
                 for (std::size_t i = 0; i < Ns; ++i) {
-                    if (radii_host[i] > 0) {
-                        grad_accum[i] += std::hypot(vxy_host[2 * i], vxy_host[2 * i + 1]);
-                        grad_count[i] += 1;
+                    if (st.radii_host[i] > 0) {
+                        st.grad_accum[i] += std::hypot(st.vxy_host[2 * i], st.vxy_host[2 * i + 1]);
+                        st.grad_count[i] += 1;
                     }
                 }
             }
 
-            if (cam == 0 || step == iters) { // cam 0 each cycle => comparable convergence signal
-                log_l1(cam, step);
+            if (cam == 0 || step == st.total_iters) { // cam 0 each cycle => comparable convergence signal
+                const float l1 = vkTrainOutputL1(context, st, cam);
+                if (l1 >= 0.0f) {
+                    st.last_loss = l1;
+                    LOG_WARN("vk-train step {:4d}  cam {:2d}  L1={:.6f}", step, static_cast<int>(cam), l1);
+                }
             }
 
-            if (step >= start_refine && step <= stop_refine && (step % refine_every) == 0) {
-                densify(step);
-                adam_t = 1; // re-clear Adam moments at the new splat count on the next optimizer step
+            if (step >= st.start_refine && step <= st.stop_refine && (step % st.refine_every) == 0) {
+                vkTrainDensify(context, st, step);
+                st.adam_t = 1; // re-clear Adam moments at the new splat count on the next optimizer step
             }
         }
+        return executed;
+    }
 
-        // Read the final optimizer-updated raw params out of the owned device buffers back
-        // into the model so it can be saved (the host-copy input path does NOT alias them).
-        syncDeviceToModel();
+    std::expected<void, std::string> VksplatViewportRenderer::runMultiCameraTraining(
+        VulkanContext& context,
+        lfs::core::SplatData& model,
+        const std::vector<lfs::rendering::ViewportRenderRequest>& requests,
+        const std::vector<std::vector<float>>& gts,
+        int iters) {
+        VkTrainState st;
+        st.model = &model;
+        st.requests = &requests;
+        st.gts = &gts;
+        st.total_iters = iters;
+        if (auto r = vkTrainInit(context, st); !r)
+            return std::unexpected(r.error());
+        while (st.current_iter < st.total_iters) {
+            auto r = vkTrainStep(context, st, st.total_iters - st.current_iter);
+            if (!r)
+                return std::unexpected(r.error());
+            if (*r == 0)
+                break;
+        }
+        vkTrainWriteBack(st);
         return {};
     }
 

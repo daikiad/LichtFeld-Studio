@@ -138,6 +138,38 @@ namespace lfs::vis {
             const std::vector<lfs::rendering::ViewportRenderRequest>& requests,
             const std::vector<std::vector<float>>& gts,
             int iters);
+
+        // Steppable form of the multi-camera trainer, so the GUI can drive training a few
+        // iterations per frame on the main thread and present the in-progress device buffers
+        // live. runMultiCameraTraining is a thin wrapper: init -> step(all) -> writeBack.
+        // The model + requests/gts are borrowed by reference and must outlive the state.
+        struct VkTrainState {
+            lfs::core::SplatData* model = nullptr;
+            const std::vector<lfs::rendering::ViewportRenderRequest>* requests = nullptr;
+            const std::vector<std::vector<float>>* gts = nullptr;
+            int total_iters = 0;
+            int current_iter = 0; // last completed iteration (0 = none yet)
+            std::uint32_t adam_t = 1;
+            std::vector<double> grad_accum;
+            std::vector<int> grad_count;
+            std::vector<float> vxy_host;
+            std::vector<std::int32_t> radii_host;
+            int refine_every = 100;
+            int start_refine = 500;
+            int stop_refine = 0;
+            std::size_t max_cap = 3'000'000;
+            float min_opacity = 0.005f;
+            float grow_fraction = 0.05f;
+            float last_loss = 0.0f;
+            bool primed = false;
+        };
+        // Validate inputs, prime the ring slots, and size the densification stat buffers.
+        [[nodiscard]] std::expected<void, std::string> vkTrainInit(VulkanContext& context, VkTrainState& st);
+        // Run up to n_iters more training iterations (stops at total_iters). Returns the
+        // number of iterations actually executed.
+        [[nodiscard]] std::expected<int, std::string> vkTrainStep(VulkanContext& context, VkTrainState& st, int n_iters);
+        // Read the optimizer-updated device params back into the model's host tensors.
+        void vkTrainWriteBack(VkTrainState& st);
         // Diagnostic: render once (force upload) and return the resulting num_indices
         // (tile-instance count). Used to brute-force the dataset-camera pose convention.
         [[nodiscard]] std::size_t probeNumIndices(
@@ -176,6 +208,12 @@ namespace lfs::vis {
         void reset();
 
     private:
+        // One densification pass (clone top-gradient + prune low-opacity) on st.model,
+        // mutating host/canonical tensors then re-priming the device buffers.
+        void vkTrainDensify(VulkanContext& context, VkTrainState& st, int step);
+        // Mean L1 of the current Main output image vs the camera's GT (-1 on failure).
+        [[nodiscard]] float vkTrainOutputL1(VulkanContext& context, const VkTrainState& st, std::size_t cam) const;
+
         struct ComposePipeline;
         struct InputBindingResult {
             bool uses_temporary_upload_slot = false;
