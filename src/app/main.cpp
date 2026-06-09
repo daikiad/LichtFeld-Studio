@@ -4,6 +4,7 @@
 
 #include "app/application.hpp"
 #include "app/converter.hpp"
+#include "app/vk_train.hpp"
 #include "core/argument_parser.hpp"
 #include "core/executable_path.hpp"
 #include "core/logger.hpp"
@@ -215,6 +216,12 @@ int main(int argc, char* argv[]) {
         } else if constexpr (std::is_same_v<T, lfs::core::args::TrainingMode>) {
             LOG_INFO("LichtFeld Studio");
             LOG_INFO("version {} | tag {}", GIT_TAGGED_VERSION, GIT_COMMIT_HASH_SHORT);
+
+            // No-CUDA Vulkan training path (macOS/MoltenVK): bypass the CUDA-coupled
+            // Trainer entirely, before any CUDA context probing.
+            if (mode.params->optimization.vk_train) {
+                return lfs::app::runVkTrain(std::move(mode.params));
+            }
 
             // Probe and decompose the CUDA driver's context-creation cost only for the
             // GPU app path. CLI-only modes such as --help, convert, plugin, and

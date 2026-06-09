@@ -113,6 +113,7 @@ namespace lfs::core {
             bool enable_save_eval_images = true;               // Save during evaluation images
             bool headless = false;                             // Disable visualization during training
             bool auto_train = false;                           // Start training immediately on startup
+            bool vk_train = false;                             // Headless no-CUDA Vulkan training (macOS/MoltenVK)
             bool no_splash = false;                            // Skip splash screen on startup
             bool debug_python = false;                         // Start debugpy listener for plugin debugging
             int debug_python_port = 5678;                      // Port for debugpy listener
