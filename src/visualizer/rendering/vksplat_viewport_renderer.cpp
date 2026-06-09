@@ -3831,7 +3831,9 @@ namespace lfs::vis {
 
     float VksplatViewportRenderer::vkTrainOutputL1(VulkanContext& context, const VkTrainState& st,
                                                    std::size_t cam) const {
-        auto cur = readOutputImageRgb8(context, OutputSlot::Main);
+        // Training renders into the Preview slot so it never fights the viewport's Main output
+        // (which the GUI presents); otherwise the two churn Main's size every frame.
+        auto cur = readOutputImageRgb8(context, OutputSlot::Preview);
         if (!cur || !*cur || !(*cur)->is_valid())
             return -1.0f;
         const std::uint8_t* c = (*cur)->ptr<std::uint8_t>();
@@ -3937,7 +3939,7 @@ namespace lfs::vis {
         st.grad_accum.assign(new_N, 0.0);
         st.grad_count.assign(new_N, 0);
         for (int w = 0; w < static_cast<int>(kInputRingSize) + 1; ++w)
-            (void)render(context, model, (*st.requests)[0], /*force_input_upload=*/true, OutputSlot::Main, false);
+            (void)render(context, model, (*st.requests)[0], /*force_input_upload=*/true, OutputSlot::Preview, false);
         LOG_WARN("vk-train densify @step {:4d}: {} -> {} splats (kept {}, cloned {})",
                  step, N, new_N, keep.size(), clone.size());
     }
@@ -3956,7 +3958,7 @@ namespace lfs::vis {
         // force_input_upload=false keep the optimizer's in-place device updates.
         for (int w = 0; w < static_cast<int>(kInputRingSize) + 1; ++w) {
             auto r = render(context, *st.model, (*st.requests)[0], /*force_input_upload=*/true,
-                            OutputSlot::Main, /*synchronize_input_upload=*/false);
+                            OutputSlot::Preview, /*synchronize_input_upload=*/false);
             if (!r)
                 return std::unexpected("vk-train prime render failed: " + r.error());
         }
@@ -3993,7 +3995,7 @@ namespace lfs::vis {
         for (int step = st.current_iter + 1; step <= end; ++step) {
             const std::size_t cam = static_cast<std::size_t>(step - 1) % n_cams;
             auto r = render(context, model, requests[cam], /*force_input_upload=*/false,
-                            OutputSlot::Main, /*synchronize_input_upload=*/false);
+                            OutputSlot::Preview, /*synchronize_input_upload=*/false);
             if (!r)
                 return std::unexpected("multi-cam render failed: " + r.error());
             st.current_iter = step;
