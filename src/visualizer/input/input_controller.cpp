@@ -2076,6 +2076,11 @@ namespace lfs::vis {
             }
         }
 
+        // Match the camera gizmo's world-basis flip (DATASET_CAMERA_GIZMO_WORLD_FLIP_4, a 180°
+        // Y rotation) so "go to camera view" lands at the gizmo's displayed pose facing the
+        // splats, not the un-flipped reflected pose.
+        scene_transform = scene_transform * lfs::rendering::DATASET_CAMERA_GIZMO_WORLD_FLIP_4;
+
         const auto pose = lfs::rendering::visualizerCameraPoseFromDataWorldToCamera(
             lfs::rendering::mat3FromRowMajor3x3(R_data),
             glm::vec3(T_data[0], T_data[1], T_data[2]),
