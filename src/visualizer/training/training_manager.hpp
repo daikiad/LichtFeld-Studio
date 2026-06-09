@@ -77,6 +77,13 @@ namespace lfs::vis {
         [[nodiscard]] const lfs::core::param::TrainingParameters& vkParams() const { return vk_params_; }
         // Called by the viewer when the stepped Vulkan training finishes (or errors).
         void finishVkTraining(bool success);
+        // Push per-step VK progress so the status getters (read by the status bar / panels)
+        // reflect the no-CUDA trainer, which has no CUDA Trainer object to query.
+        void setVkProgress(int iteration, float loss, int num_splats) {
+            vk_iter_ = iteration;
+            vk_loss_ = loss;
+            vk_splats_ = num_splats;
+        }
 
         // Temporary pause (for camera movement - doesn't change UI state)
         struct TemporaryPauseResult {
@@ -199,6 +206,9 @@ namespace lfs::vis {
         bool vk_trainable_ = false;
         bool vk_active_ = false;
         int vk_total_iters_ = 30000;
+        int vk_iter_ = 0;
+        float vk_loss_ = 0.0f;
+        int vk_splats_ = 0;
         lfs::core::param::TrainingParameters vk_params_;
 
         // State machine (single source of truth for state)

@@ -745,20 +745,28 @@ namespace lfs::vis {
     }
 
     int TrainerManager::getCurrentIteration() const {
+        if (vk_active_)
+            return vk_iter_;
         return trainer_ ? trainer_->get_current_iteration() : 0;
     }
 
     float TrainerManager::getCurrentLoss() const {
+        if (vk_active_)
+            return vk_loss_;
         return trainer_ ? trainer_->get_current_loss() : 0.0f;
     }
 
     int TrainerManager::getTotalIterations() const {
+        if (vk_active_ || vk_trainable_)
+            return vk_total_iters_;
         if (!trainer_)
             return 0;
         return trainer_->get_total_iterations();
     }
 
     int TrainerManager::getNumSplats() const {
+        if (vk_active_)
+            return vk_splats_;
         if (!trainer_)
             return 0;
 

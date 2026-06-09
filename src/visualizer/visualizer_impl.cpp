@@ -1396,6 +1396,9 @@ namespace lfs::vis {
         // reactive signals only refresh (and the panel only redraws) via this path; the C++
         // app-store write alone doesn't notify them. Mirrors what the CUDA trainer relies on.
         python::update_training_progress(st.current_iter, st.last_loss, static_cast<std::size_t>(gaussians));
+        // Feed the C++ status getters (read by the bottom status bar) which otherwise query the
+        // absent CUDA trainer and report 0/0.
+        trainer_manager_->setVkProgress(st.current_iter, st.last_loss, gaussians);
         // Periodic host read-back for the gaussian-count UI + eventual save; the viewport
         // itself renders the device buffers directly so it stays live without this.
         if (st.current_iter % 100 == 0)

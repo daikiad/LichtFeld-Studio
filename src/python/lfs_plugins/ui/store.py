@@ -62,6 +62,11 @@ class StateSignal(Generic[T]):
         if native is not None:
             self._fallback = new_value
             native.set(self._field, new_value)
+            # Also notify Python-side subscribers directly. The native store's C++->Python
+            # change notification isn't reliably delivered on every platform (macOS), so without
+            # this the bound UI (e.g. the training status line) never refreshes even though the
+            # value was written.
+            self._notify()
             return
 
         if self._fallback == new_value:
