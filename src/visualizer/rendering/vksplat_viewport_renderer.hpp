@@ -117,6 +117,16 @@ namespace lfs::vis {
         [[nodiscard]] bool nextOutputImagesNeedResize(
             glm::ivec2 size,
             OutputSlot output_slot = OutputSlot::Main) const;
+
+        // No-CUDA Vulkan training self-test: renders the model as ground truth, darkens
+        // it, then trains the model back toward the darkened image for `iters` steps,
+        // logging the L1 loss each step (it must decrease). Proves the backward+Adam
+        // path works end-to-end on MoltenVK. Self-contained — no dataset needed.
+        [[nodiscard]] std::expected<void, std::string> runTrainingSelfTest(
+            VulkanContext& context,
+            const lfs::core::SplatData& splat_data,
+            const lfs::rendering::ViewportRenderRequest& request,
+            int iters);
         [[nodiscard]] std::expected<std::shared_ptr<lfs::core::Tensor>, std::string> readOutputImage(
             VulkanContext& context,
             OutputSlot output_slot = OutputSlot::Main) const;
@@ -342,6 +352,9 @@ namespace lfs::vis {
         mutable VkFence readback_fence_ = VK_NULL_HANDLE;
         VulkanGSRenderer renderer_;
         VulkanGSPipelineBuffers buffers_;
+        // Cached forward uniforms from the most recent render(), reused by the no-CUDA
+        // training backward pass (the projection backward recomputes the same projection).
+        VulkanGSRendererUniforms last_uniforms_{};
         std::unique_ptr<ComposePipeline> compose_;
         struct OutputImageSlot {
             VulkanContext::ExternalImage image{};

@@ -3682,6 +3682,107 @@ namespace lfs::vis {
         return std::make_shared<lfs::core::Tensor>(std::move(tensor));
     }
 
+    std::expected<void, std::string> VksplatViewportRenderer::runTrainingSelfTest(
+        VulkanContext& context,
+        const lfs::core::SplatData& splat_data,
+        const lfs::rendering::ViewportRenderRequest& request,
+        int iters) {
+        using lfs::core::Tensor;
+
+        // Prime all ring slots with the original model so the training loop can render
+        // with force_input_upload=false and the optimizer's in-place param updates are
+        // not clobbered by a re-upload (see the ring-slot note in the design memory).
+        for (int w = 0; w < static_cast<int>(kInputRingSize) + 1; ++w) {
+            auto r = render(context, splat_data, request, /*force_input_upload=*/true,
+                            OutputSlot::Main, /*synchronize_input_upload=*/false);
+            if (!r) {
+                return std::unexpected("self-test prime render failed: " + r.error());
+            }
+        }
+        const std::size_t H = last_uniforms_.image_height;
+        const std::size_t W = last_uniforms_.image_width;
+        const std::size_t P = H * W;
+        if (P == 0 || buffers_.num_splats == 0) {
+            return std::unexpected("self-test: empty render target or model");
+        }
+
+        // Ground truth = the current render darkened by 0.5 (a learnable target the model
+        // can reach by lowering its SH DC / opacity).
+        auto gt_img = readOutputImageRgb8(context, OutputSlot::Main);
+        if (!gt_img || !*gt_img || !(*gt_img)->is_valid()) {
+            return std::unexpected("self-test ground-truth readback failed");
+        }
+        std::vector<float> gt(3 * P);
+        {
+            const std::uint8_t* g = (*gt_img)->ptr<std::uint8_t>();
+            for (std::size_t i = 0; i < 3 * P; ++i) {
+                gt[i] = (g[i] / 255.0f) * 0.5f;
+            }
+        }
+
+        LOG_WARN("vk-train self-test: N={} splats, image={}x{}, {} iters (target = render * 0.5)",
+                 buffers_.num_splats, W, H, iters);
+
+        std::vector<float> v(4 * P, 0.0f);
+        const float inv = 1.0f / static_cast<float>(3 * P);
+        for (int step = 1; step <= iters; ++step) {
+            auto r = render(context, splat_data, request, /*force_input_upload=*/false,
+                            OutputSlot::Main, /*synchronize_input_upload=*/false);
+            if (!r) {
+                return std::unexpected("self-test render failed: " + r.error());
+            }
+            auto cur = readOutputImageRgb8(context, OutputSlot::Main);
+            if (!cur || !*cur || !(*cur)->is_valid()) {
+                return std::unexpected("self-test readback failed");
+            }
+            const std::uint8_t* c = (*cur)->ptr<std::uint8_t>();
+
+            // CPU mean-L1 loss + gradient dL/d(pixel) = sign(render - gt)/(3P); alpha 0.
+            double l1 = 0.0;
+            std::fill(v.begin(), v.end(), 0.0f);
+            for (std::size_t p = 0; p < P; ++p) {
+                for (int ch = 0; ch < 3; ++ch) {
+                    const float rr = c[3 * p + ch] / 255.0f;
+                    const float d = rr - gt[3 * p + ch];
+                    l1 += std::abs(d);
+                    v[4 * p + ch] = (d > 0.0f ? 1.0f : (d < 0.0f ? -1.0f : 0.0f)) * inv;
+                }
+            }
+            l1 /= static_cast<double>(3 * P);
+
+            FusedSplitOptimizerUniforms ou{};
+            ou.step = static_cast<std::uint32_t>(step);
+            ou.active_sh = last_uniforms_.active_sh | (last_uniforms_.camera_model << 8);
+            ou.num_splats = static_cast<std::uint32_t>(buffers_.num_splats);
+            ou.image_size = (static_cast<std::uint32_t>(H) << 16) | static_cast<std::uint32_t>(W);
+            ou.shN_slots_per_primitive = last_uniforms_.shN_layout_slots;
+            ou.fx = last_uniforms_.fx;
+            ou.fy = last_uniforms_.fy;
+            ou.cx = last_uniforms_.cx;
+            ou.cy = last_uniforms_.cy;
+            for (int i = 0; i < 4; ++i)
+                ou.dist_coeffs[i] = last_uniforms_.dist_coeffs[i];
+            for (int i = 0; i < 16; ++i)
+                ou.world_view_transform[i] = last_uniforms_.world_view_transform[i];
+            ou.lr_means = 1.6e-4f;
+            ou.lr_quats = 1.0e-3f;
+            ou.lr_scales = 5.0e-3f;
+            ou.lr_opacities = 5.0e-2f;
+            ou.lr_sh_dc = 2.5e-3f;
+            ou.reg_scale = 0.0f;
+            ou.reg_opacity = 0.0f;
+
+            const std::size_t pix_floats = 4 * P;
+            auto& vbuf = renderer_.resizeDeviceBuffer(buffers_.v_current_pixel_state, pix_floats);
+            renderer_.uploadHostBufferToDevice(vbuf, v.data(), pix_floats * sizeof(float));
+            renderer_.executeRasterizeBackward(last_uniforms_, buffers_);
+            renderer_.executeFusedProjectionBackwardOptimizerSplit(ou, buffers_);
+
+            LOG_WARN("vk-train step {:3d}  L1={:.6f}", step, l1);
+        }
+        return {};
+    }
+
     std::expected<void, std::string> VksplatViewportRenderer::readOutputImageIntoCpuHwc(
         VulkanContext& context,
         const OutputSlot output_slot,
@@ -4762,6 +4863,8 @@ namespace lfs::vis {
                                           request.mip_filter);
             uniforms.step = static_cast<std::uint32_t>(modelTransformCount(request.scene.model_transforms));
         }
+        // Cache for the no-CUDA training backward pass (recomputes the same projection).
+        last_uniforms_ = uniforms;
 
         const std::size_t target_sort_capacity = std::max(buffers_.num_indices, buffers_.num_splats);
         // Reserve from the exact measured tile-instance count. num_indices is the

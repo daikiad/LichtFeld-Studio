@@ -178,6 +178,17 @@ public:
     void executeApplyDepthOrdering(const VulkanGSRendererUniforms& uniforms,
                                    VulkanGSPipelineBuffers& buffers);
 
+    // --- backward / training (no-CUDA Vulkan path) ---
+    // Per-pixel blending backward: scatters dL/d(pixel) into screen-space gradients
+    // (v_xy_vs, v_inv_cov_vs_opacity, v_rgb). Requires v_current_pixel_state populated.
+    void executeRasterizeBackward(const VulkanGSRendererUniforms& uniforms,
+                                  VulkanGSPipelineBuffers& buffers);
+    // Split-raw projection backward + fused Adam: consumes the screen-space gradients
+    // and updates the SplatData raw param buffers in place. Moments persist; pass
+    // step==1 to zero them on the first iteration.
+    void executeFusedProjectionBackwardOptimizerSplit(
+        const FusedSplitOptimizerUniforms& uniforms, VulkanGSPipelineBuffers& buffers);
+
 protected:
     void executeCumsum(
         VulkanGSPipelineBuffers& buffers,
@@ -207,17 +218,6 @@ protected:
                                         const _VulkanBuffer& overlay_flags,
                                         const _VulkanBuffer& overlay_params,
                                         bool overlays_active);
-
-    // --- backward / training (no-CUDA Vulkan path) ---
-    // Per-pixel blending backward: scatters dL/d(pixel) into screen-space gradients
-    // (v_xy_vs, v_inv_cov_vs_opacity, v_rgb). Requires v_current_pixel_state populated.
-    void executeRasterizeBackward(const VulkanGSRendererUniforms& uniforms,
-                                  VulkanGSPipelineBuffers& buffers);
-    // Split-raw projection backward + fused Adam: consumes the screen-space gradients
-    // and updates the SplatData raw param buffers in place. Moments persist; pass
-    // step==1 to zero them on the first iteration.
-    void executeFusedProjectionBackwardOptimizerSplit(
-        const FusedSplitOptimizerUniforms& uniforms, VulkanGSPipelineBuffers& buffers);
 
     _ComputePipeline pipeline_projection_forward = _ComputePipeline(19);
     _ComputePipeline pipeline_projection_forward_3dgut = _ComputePipeline(19);

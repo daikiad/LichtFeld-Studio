@@ -1622,6 +1622,19 @@ namespace lfs::vis {
                     }
 
                     const bool force_input_upload = (frame_dirty & DirtyFlag::SPLATS) != 0;
+                    // No-CUDA Vulkan training self-test (LFS_VK_TRAIN_SELFTEST): run once
+                    // on the loaded model to verify the backward+Adam path reduces loss.
+                    if (std::getenv("LFS_VK_TRAIN_SELFTEST")) {
+                        static bool vk_train_selftest_done = false;
+                        if (!vk_train_selftest_done) {
+                            vk_train_selftest_done = true;
+                            auto st = vksplat_viewport_renderer_->runTrainingSelfTest(
+                                *context.vulkan_context, *model, request, 100);
+                            if (!st) {
+                                LOG_ERROR("vk-train self-test failed: {}", st.error());
+                            }
+                        }
+                    }
                     LOG_TIMER("vksplat.render");
                     std::expected<VksplatViewportRenderer::RenderResult, std::string> render_result =
                         std::unexpected("VkSplat render was not executed");
