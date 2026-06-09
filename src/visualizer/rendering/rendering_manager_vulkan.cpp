@@ -653,7 +653,14 @@ namespace lfs::vis {
             markDirty(DirtyFlag::ALL);
         }
 
-        const bool synchronize_vksplat_input_upload = is_training;
+        // The synchronized (training) forward path needs CUDA/Vulkan interop to share the
+        // trainer's arena. On macOS (no interop) the no-CUDA Vulkan trainer updates the
+        // renderer's device buffers in-place on this thread, so the viewport just renders
+        // those buffers via the normal async path — never the synchronized one.
+        const bool vksplat_interop =
+            context.vulkan_context && context.vulkan_context->externalMemoryInteropEnabled();
+        const bool vk_live_training = is_training && !vksplat_interop;
+        const bool synchronize_vksplat_input_upload = is_training && vksplat_interop;
         if (const DirtyMask training_dirty = frame_lifecycle_service_.handleTrainingRefresh(
                 is_training,
                 framerate_controller_.getSettings().training_frame_refresh_time_sec);
@@ -775,8 +782,12 @@ namespace lfs::vis {
         }
 
         std::optional<ScopedTemporaryTrainingPause> viewport_resize_training_pause;
+        // The pause-to-resize dance is only needed for CUDA training (shared interop output
+        // images). The no-CUDA Vulkan trainer is single-threaded with the render loop and
+        // self-allocates its output, so let the resize happen inline instead of skipping the
+        // frame (which would freeze the live view).
         const bool vksplat_viewport_resize =
-            is_training &&
+            is_training && vksplat_interop &&
             context.vulkan_context != nullptr &&
             vksplat_viewport_renderer_ != nullptr &&
             vksplat_viewport_renderer_->nextOutputImagesNeedResize(
@@ -975,8 +986,12 @@ namespace lfs::vis {
                 if (!vksplat_viewport_renderer_) {
                     vksplat_viewport_renderer_ = std::make_unique<VksplatViewportRenderer>();
                 }
+                // During no-CUDA live training, never re-upload the model: the trainer owns the
+                // device buffers and updates them in-place each step, so reading them (no upload)
+                // is what shows live progress. A re-upload would clobber the in-flight params.
                 const bool force_input_upload =
-                    (frame_dirty & DirtyFlag::SPLATS) != 0 && !vksplat_inputs_forced_this_frame;
+                    !vk_live_training && (frame_dirty & DirtyFlag::SPLATS) != 0 &&
+                    !vksplat_inputs_forced_this_frame;
                 LOG_TIMER("vksplat.split_panel.render");
                 auto result = vksplat_viewport_renderer_->render(
                     *context.vulkan_context,
