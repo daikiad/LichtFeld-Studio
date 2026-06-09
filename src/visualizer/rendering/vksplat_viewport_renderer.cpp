@@ -183,11 +183,15 @@ namespace lfs::vis {
             constexpr std::string_view probe_file = "generated/projection_forward.spv";
             std::vector<std::filesystem::path> search_paths;
 
-            search_paths.push_back(lfs::core::getResourceBaseDir() / "shaders" / "vulkan_rasterizer");
-
 #ifdef LFS_VULKAN_RASTERIZER_DEV_SPV_DIR
+            // Dev builds: prefer the build tree's freshly-compiled SPIR-V. The POST_BUILD
+            // copy into resources/ only fires when the executable relinks, so after a
+            // shader-only edit resources/ is stale; loading the dev dir first avoids
+            // silently running an old shader.
             search_paths.push_back(lfs::core::utf8_to_path(LFS_VULKAN_RASTERIZER_DEV_SPV_DIR));
 #endif
+
+            search_paths.push_back(lfs::core::getResourceBaseDir() / "shaders" / "vulkan_rasterizer");
 
 #ifdef PROJECT_ROOT_PATH
             search_paths.push_back(lfs::core::utf8_to_path(PROJECT_ROOT_PATH) /
