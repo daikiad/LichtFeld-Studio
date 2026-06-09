@@ -32,6 +32,13 @@
 
 namespace lfs::vis {
 
+    VksplatViewportRenderer* RenderingManager::vksplatRenderer() {
+        if (!vksplat_viewport_renderer_) {
+            vksplat_viewport_renderer_ = std::make_unique<VksplatViewportRenderer>();
+        }
+        return vksplat_viewport_renderer_.get();
+    }
+
     namespace {
         constexpr auto kVulkanViewportResizeTrainingPauseWait = std::chrono::milliseconds(300);
 

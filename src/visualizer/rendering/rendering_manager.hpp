@@ -111,7 +111,9 @@ namespace lfs::vis {
 
         // Borrowed access to the Vulkan splat renderer (no-CUDA Vulkan training drives it
         // a few steps per frame and the viewport presents its in-place-updated buffers).
-        [[nodiscard]] VksplatViewportRenderer* vksplatRenderer() { return vksplat_viewport_renderer_.get(); }
+        // Lazily creates it: before training the scene may only have a point cloud, so the
+        // renderer (normally created on the first splat render) wouldn't exist yet.
+        [[nodiscard]] VksplatViewportRenderer* vksplatRenderer();
 
         enum class VksplatSelectionMaskShape : std::uint32_t {
             Brush = 0,
