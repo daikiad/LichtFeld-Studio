@@ -3857,34 +3857,102 @@ namespace lfs::vis {
         if (N == 0)
             return;
         auto op_cpu = model.opacity_raw().cpu().contiguous();
+        auto sc_cpu = model.scaling_raw().cpu().contiguous();
+        auto rt_cpu = model.rotation_raw().cpu().contiguous();
+        auto mn_cpu = model.means_raw().cpu().contiguous();
         const float* opp = op_cpu.ptr<float>();
+        const float* scp = sc_cpu.ptr<float>();
+        const float* rtp = rt_cpu.ptr<float>();
+        const float* mnp = mn_cpu.ptr<float>();
+
+        // --- Percentile bounds (MRNF launch_percentile_bounds, p = bounds_percentile) ---
+        float center[3] = {0.0f, 0.0f, 0.0f};
+        float extent[3] = {0.0f, 0.0f, 0.0f};
+        {
+            const float low_p = (1.0f - st.bounds_percentile) * 0.5f;
+            const float high_p = 1.0f - low_p;
+            const std::size_t li = static_cast<std::size_t>(std::floor(low_p * static_cast<float>(N - 1)));
+            const std::size_t hi = static_cast<std::size_t>(std::floor(high_p * static_cast<float>(N - 1)));
+            std::vector<float> ax(N);
+            for (int a = 0; a < 3; ++a) {
+                for (std::size_t i = 0; i < N; ++i)
+                    ax[i] = mnp[3 * i + a];
+                std::nth_element(ax.begin(), ax.begin() + li, ax.end());
+                const float lo = ax[li];
+                std::nth_element(ax.begin(), ax.begin() + hi, ax.end());
+                const float h = ax[hi];
+                center[a] = (lo + h) * 0.5f;
+                extent[a] = (h - lo) * 0.5f;
+            }
+        }
+        float ext3[3] = {extent[0], extent[1], extent[2]};
+        std::sort(ext3, ext3 + 3);
+        const float max_allowed = ext3[2] * 100.0f;
+        const float log_max_allowed = std::log(std::max(max_allowed, 1e-12f));
+
+        // --- PRUNE (MRNF prune_mask: raw opacity, near-zero rot, scale min/max, distance) ---
+        constexpr float kRawOpacityPrune = -5.54126358f; // logit(1/255)
+        constexpr float kLogMinScale = -23.0258509f;     // log(1e-10)
         std::vector<std::int32_t> keep;
         keep.reserve(N);
-        std::vector<std::pair<float, std::int32_t>> cand;
+        std::vector<int> orig_to_keeprow(N, -1);
         for (std::size_t i = 0; i < N; ++i) {
-            const float opac = 1.0f / (1.0f + std::exp(-opp[i]));
-            if (opac <= st.min_opacity)
-                continue;
-            keep.push_back(static_cast<std::int32_t>(i));
-            if (i < st.grad_count.size() && st.grad_count[i] > 0)
-                cand.push_back({static_cast<float>(st.grad_accum[i] / st.grad_count[i]), static_cast<std::int32_t>(i)});
+            const float qw = rtp[4 * i], qx = rtp[4 * i + 1], qy = rtp[4 * i + 2], qz = rtp[4 * i + 3];
+            const float ls0 = scp[3 * i], ls1 = scp[3 * i + 1], ls2 = scp[3 * i + 2];
+            const float lmin = std::min({ls0, ls1, ls2});
+            const float lmax = std::max({ls0, ls1, ls2});
+            const float dmax = std::max({std::fabs(mnp[3 * i] - center[0]),
+                                         std::fabs(mnp[3 * i + 1] - center[1]),
+                                         std::fabs(mnp[3 * i + 2] - center[2])});
+            const bool prune = (opp[i] < kRawOpacityPrune) ||
+                               (qw * qw + qx * qx + qy * qy + qz * qz < 1e-8f) ||
+                               (lmin < kLogMinScale) || (lmax > log_max_allowed) || (dmax > max_allowed);
+            if (!prune) {
+                orig_to_keeprow[i] = static_cast<int>(keep.size());
+                keep.push_back(static_cast<std::int32_t>(i));
+            }
         }
         if (keep.empty())
             return;
-        std::size_t want = static_cast<std::size_t>(st.grow_fraction * static_cast<float>(keep.size()));
-        if (keep.size() + want > st.max_cap)
-            want = st.max_cap > keep.size() ? st.max_cap - keep.size() : 0;
-        std::vector<std::int32_t> clone;
-        if (want > 0 && !cand.empty()) {
-            const std::size_t k = std::min(want, cand.size());
-            std::partial_sort(cand.begin(), cand.begin() + k, cand.end(),
+        const int pruned_count = static_cast<int>(N - keep.size());
+
+        // --- GROW candidates: refine_weight_max > threshold AND visible (MRNF) ---
+        std::vector<std::int32_t> cand;
+        for (std::int32_t i : keep) {
+            if (static_cast<std::size_t>(i) < st.refine_weight_max.size() &&
+                st.refine_weight_max[i] > st.growth_grad_threshold && st.vis_count[i] > 0.0f)
+                cand.push_back(i);
+        }
+        const int budget = st.max_cap > keep.size() ? static_cast<int>(st.max_cap - keep.size()) : 0;
+        int n_total = (step < st.grow_until_iter)
+                          ? std::min(static_cast<int>(std::lround(st.grow_fraction * static_cast<float>(cand.size()))),
+                                     budget)
+                          : std::min(pruned_count, budget); // after grow_until only backfill pruned capacity
+        n_total = std::clamp(n_total, 0, static_cast<int>(cand.size()));
+
+        // --- Gumbel-top-k selection weighted by refine_weight_max (MRNF launch_gumbel_topk).
+        // RNG can't be bit-identical to the CUDA path (curand, wall-clock seed); same formula/distribution. ---
+        std::vector<std::int32_t> split_idx;
+        if (n_total > 0) {
+            std::mt19937 rng(static_cast<std::uint32_t>(step) * 2654435761u + 12345u);
+            std::uniform_real_distribution<float> uni(0.0f, 1.0f);
+            std::vector<std::pair<float, std::int32_t>> keys;
+            keys.reserve(cand.size());
+            for (std::int32_t i : cand) {
+                const float w = std::max(st.refine_weight_max[i], 1e-30f);
+                const float u = std::clamp(uni(rng), 1e-10f, 1.0f - 1e-7f);
+                keys.push_back({-std::log(-std::log(u)) + std::log(w), i});
+            }
+            const std::size_t k = std::min(static_cast<std::size_t>(n_total), keys.size());
+            std::partial_sort(keys.begin(), keys.begin() + k, keys.end(),
                               [](const auto& a, const auto& b) { return a.first > b.first; });
             for (std::size_t c = 0; c < k; ++c)
-                clone.push_back(cand[c].second);
+                split_idx.push_back(keys[c].second);
         }
-        const std::size_t new_N = keep.size() + clone.size();
-        // Plain-C++ row gather+clone (avoids index_select/cat device dispatch on host-CUDA tensors).
-        const auto gatherClone = [&](const lfs::core::Tensor& src) -> lfs::core::Tensor {
+        const std::size_t new_N = keep.size() + split_idx.size();
+
+        // Plain-C++ row gather: kept rows then split-child copies (child B = parent copy).
+        const auto gather = [&](const lfs::core::Tensor& src) -> lfs::core::Tensor {
             auto s = src.cpu().contiguous();
             const float* sp = s.ptr<float>();
             const std::size_t n_old = static_cast<std::size_t>(src.shape()[0]);
@@ -3901,47 +3969,92 @@ namespace lfs::vis {
                 std::memcpy(dp + j * row, sp + static_cast<std::size_t>(i) * row, row * sizeof(float));
                 ++j;
             }
-            for (std::int32_t i : clone) {
+            for (std::int32_t i : split_idx) {
                 std::memcpy(dp + j * row, sp + static_cast<std::size_t>(i) * row, row * sizeof(float));
                 ++j;
             }
             return out.to(src.device());
         };
-        model.means_raw() = gatherClone(model.means_raw());
-        model.sh0() = gatherClone(model.sh0());
-        model.rotation_raw() = gatherClone(model.rotation_raw());
-        model.scaling_raw() = gatherClone(model.scaling_raw());
-        model.opacity_raw() = gatherClone(model.opacity_raw());
+        model.means_raw() = gather(model.means_raw());
+        model.sh0() = gather(model.sh0());
+        model.rotation_raw() = gather(model.rotation_raw());
+        model.scaling_raw() = gather(model.scaling_raw());
+        model.opacity_raw() = gather(model.opacity_raw());
         auto canon = model.shN_canonical_cpu();
         if (canon.is_valid() && canon.numel() > 0) {
-            auto new_canon = gatherClone(canon);
+            auto new_canon = gather(canon);
             model.shN_set_from_canonical(new_canon, new_N);
         }
 
-        // Break clone symmetry: offset each cloned copy's position by ~1 sigma (its world
-        // scale = exp(scaling_raw)) in a random direction so the two splats diverge.
-        if (!clone.empty()) {
-            auto m_cpu = model.means_raw().cpu().contiguous();
-            auto s_cpu = model.scaling_raw().cpu().contiguous();
-            float* mp = m_cpu.ptr<float>();
-            const float* scp = s_cpu.ptr<float>();
-            std::mt19937 rng(static_cast<std::uint32_t>(step) * 2654435761u + 12345u);
-            std::uniform_real_distribution<float> uni(-1.0f, 1.0f);
-            for (std::size_t c = 0; c < clone.size(); ++c) {
-                const std::size_t r = keep.size() + c;
-                mp[3 * r + 0] += uni(rng) * std::exp(scp[3 * r + 0]);
-                mp[3 * r + 1] += uni(rng) * std::exp(scp[3 * r + 1]);
-                mp[3 * r + 2] += uni(rng) * std::exp(scp[3 * r + 2]);
+        // --- Long-axis SPLIT (densification_kernels.cu long_axis_split) + opacity/scale DECAY
+        // (MRNF apply_decay), in one host pass over the rebuilt rows. ---
+        {
+            auto m2 = model.means_raw().cpu().contiguous();
+            auto s2 = model.scaling_raw().cpu().contiguous();
+            auto o2 = model.opacity_raw().cpu().contiguous();
+            auto r2 = model.rotation_raw().cpu().contiguous();
+            float* mp = m2.ptr<float>();
+            float* sp = s2.ptr<float>();
+            float* op2 = o2.ptr<float>();
+            const float* rp = r2.ptr<float>();
+            const auto quatToR = [](const float* q, float R[9]) {
+                const float w = q[0], x = q[1], y = q[2], z = q[3]; // [w,x,y,z], not renormalized
+                R[0] = 1.0f - 2.0f * (y * y + z * z);
+                R[1] = 2.0f * (x * y - w * z);
+                R[2] = 2.0f * (x * z + w * y);
+                R[3] = 2.0f * (x * y + w * z);
+                R[4] = 1.0f - 2.0f * (x * x + z * z);
+                R[5] = 2.0f * (y * z - w * x);
+                R[6] = 2.0f * (x * z - w * y);
+                R[7] = 2.0f * (y * z + w * x);
+                R[8] = 1.0f - 2.0f * (x * x + y * y);
+            };
+            const auto invSigmoid = [](float y) {
+                y = std::clamp(y, 1e-7f, 1.0f - 1e-7f);
+                return std::log(y / (1.0f - y));
+            };
+            for (std::size_t c = 0; c < split_idx.size(); ++c) {
+                const int A = orig_to_keeprow[split_idx[c]]; // parent's kept row -> child A
+                const std::size_t B = keep.size() + c;       // child B row
+                float R[9];
+                quatToR(rp + 4 * A, R);
+                const float ls0 = sp[3 * A], ls1 = sp[3 * A + 1], ls2 = sp[3 * A + 2];
+                const int L = (ls0 >= ls1 && ls0 >= ls2) ? 0 : ((ls1 >= ls2) ? 1 : 2);
+                const float offmag = std::exp(sp[3 * A + L]) * 0.5f;
+                const float ox = R[L] * offmag, oy = R[L + 3] * offmag, oz = R[L + 6] * offmag;
+                float ns[3] = {ls0, ls1, ls2};
+                ns[L] += std::log(0.5f);
+                for (int d = 0; d < 3; ++d)
+                    if (d != L)
+                        ns[d] += std::log(0.85f);
+                const float nop = invSigmoid((1.0f / (1.0f + std::exp(-op2[A]))) * 0.6f);
+                const float omx = mp[3 * A], omy = mp[3 * A + 1], omz = mp[3 * A + 2];
+                mp[3 * A] = omx + ox; mp[3 * A + 1] = omy + oy; mp[3 * A + 2] = omz + oz;
+                mp[3 * B] = omx - ox; mp[3 * B + 1] = omy - oy; mp[3 * B + 2] = omz - oz;
+                for (int d = 0; d < 3; ++d) { sp[3 * A + d] = ns[d]; sp[3 * B + d] = ns[d]; }
+                op2[A] = nop; op2[B] = nop; // rot/sh0/shN of child B already copied by gather()
             }
-            model.means_raw() = m_cpu.to(model.means_raw().device());
+            const float train_t = st.total_iters > 0 ? static_cast<float>(step) / static_cast<float>(st.total_iters) : 0.0f;
+            const float t_shrink = 1.0f - train_t;
+            const float scale_factor = 1.0f - st.scale_decay * t_shrink;
+            for (std::size_t i = 0; i < new_N; ++i) {
+                const float sig = 1.0f / (1.0f + std::exp(-op2[i]));
+                const float o = std::clamp(sig - st.opacity_decay * t_shrink, 1e-12f, 1.0f - 1e-12f);
+                op2[i] = std::log(o / (1.0f - o));
+                for (int d = 0; d < 3; ++d)
+                    sp[3 * i + d] = std::log(std::max(std::exp(sp[3 * i + d]) * scale_factor, 1e-12f));
+            }
+            model.means_raw() = m2.to(model.means_raw().device());
+            model.scaling_raw() = s2.to(model.scaling_raw().device());
+            model.opacity_raw() = o2.to(model.opacity_raw().device());
         }
 
-        st.grad_accum.assign(new_N, 0.0);
-        st.grad_count.assign(new_N, 0);
+        st.refine_weight_max.assign(new_N, 0.0f);
+        st.vis_count.assign(new_N, 0.0f);
         for (int w = 0; w < static_cast<int>(kInputRingSize) + 1; ++w)
             (void)render(context, model, (*st.requests)[0], /*force_input_upload=*/true, OutputSlot::Preview, false);
-        LOG_WARN("vk-train densify @step {:4d}: {} -> {} splats (kept {}, cloned {})",
-                 step, N, new_N, keep.size(), clone.size());
+        LOG_WARN("vk-train densify @step {:4d}: {} -> {} splats (kept {}, split {}, pruned {}, cand {})",
+                 step, N, new_N, keep.size(), split_idx.size(), pruned_count, cand.size());
     }
 
     std::expected<void, std::string> VksplatViewportRenderer::vkTrainInit(VulkanContext& context, VkTrainState& st) {
@@ -3965,8 +4078,8 @@ namespace lfs::vis {
         if (buffers_.num_splats == 0)
             return std::unexpected("vk-train: empty model");
 
-        st.grad_accum.assign(buffers_.num_splats, 0.0);
-        st.grad_count.assign(buffers_.num_splats, 0);
+        st.refine_weight_max.assign(buffers_.num_splats, 0.0f);
+        st.vis_count.assign(buffers_.num_splats, 0.0f);
         st.adam_t = 1;
         st.current_iter = 0;
         // Densify only through the first half of training (like 3DGS' grow_until), capped at
@@ -4056,20 +4169,23 @@ namespace lfs::vis {
             // Accumulate the per-gaussian screen-space gradient magnitude (densification stat).
             {
                 const std::size_t Ns = buffers_.num_splats;
-                if (st.grad_accum.size() != Ns) {
-                    st.grad_accum.assign(Ns, 0.0);
-                    st.grad_count.assign(Ns, 0);
+                if (st.refine_weight_max.size() != Ns) {
+                    st.refine_weight_max.assign(Ns, 0.0f);
+                    st.vis_count.assign(Ns, 0.0f);
                 }
-                st.vxy_host.resize(2 * Ns);
+                st.vxy_host.resize(Ns);
                 st.radii_host.resize(Ns);
-                renderer_.downloadDeviceBufferToHost(buffers_.v_xy_vs.deviceBuffer, st.vxy_host.data(),
-                                                     2 * Ns * sizeof(float));
+                // grad_means_norm = per-gaussian ||dL/d means_ws|| (the exact 3D world means-gradient
+                // norm MRNF thresholds on); emitted by the fused optimizer shader (binding 17).
+                renderer_.downloadDeviceBufferToHost(buffers_.grad_means_norm.deviceBuffer, st.vxy_host.data(),
+                                                     Ns * sizeof(float));
                 renderer_.downloadDeviceBufferToHost(buffers_.radii.deviceBuffer, st.radii_host.data(),
                                                      Ns * sizeof(std::int32_t));
                 for (std::size_t i = 0; i < Ns; ++i) {
                     if (st.radii_host[i] > 0) {
-                        st.grad_accum[i] += std::hypot(st.vxy_host[2 * i], st.vxy_host[2 * i + 1]);
-                        st.grad_count[i] += 1;
+                        // MRNF: refine_weight_max = per-window MAX, vis_count = cumulative ADD.
+                        st.refine_weight_max[i] = std::max(st.refine_weight_max[i], st.vxy_host[i]);
+                        st.vis_count[i] += 1.0f;
                     }
                 }
             }
@@ -4082,7 +4198,7 @@ namespace lfs::vis {
                 }
             }
 
-            if (step >= st.start_refine && step <= st.stop_refine && (step % st.refine_every) == 0) {
+            if (step > st.start_refine && step < st.stop_refine && (step % st.refine_every) == 0) {
                 vkTrainDensify(context, st, step);
                 st.adam_t = 1; // re-clear Adam moments at the new splat count on the next optimizer step
             }

@@ -153,6 +153,7 @@ struct VulkanGSPipelineBuffers {
     Buffer<float> v_xy_vs;               // (N, 2)
     Buffer<float> v_inv_cov_vs_opacity;  // (N, 4)
     Buffer<float> v_rgb;                 // (N, 3)
+    Buffer<float> grad_means_norm;       // (N) ||dL/d means_ws|| per gaussian (densification stat)
     Buffer<float> v_current_pixel_state; // (H, W, 4) upstream dL/d(pixel RGBA)
     Buffer<float> train_gt;             // (H, W, 4) ground-truth image for the GPU loss
     // Adam moments in raw-param space. float buffers use stride-2 float3 packing

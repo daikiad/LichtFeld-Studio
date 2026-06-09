@@ -42,6 +42,10 @@ layout(binding = 14) RWStructuredBuffer<float> g_opacity;    // 2
 layout(binding = 15) RWStructuredBuffer<float4> g_shN_1;
 layout(binding = 16) RWStructuredBuffer<float4> g_shN_2;
 
+// Densification stat: per-gaussian ||dL/d means_ws|| (3D world-space means gradient norm),
+// the exact quantity MRNF's ADC thresholds on (growth_grad_threshold). Written every step.
+layout(binding = 17) RWStructuredBuffer<float> grad_means_norm;
+
 typedef vector<float, 1> float1;
 
 // "standard" Adam with bias correction (identical to the packed sibling shader).
@@ -136,6 +140,7 @@ struct ShaderUniforms {
 
     // v_gauss.d can be NaN when is_zero_grad; force-zero those gradients.
     const float3 v_means = is_zero_grad ? float3(0) : v_gauss.d.xyz_ws;
+    grad_means_norm[g_idx] = length(v_means); // densification stat (== MRNF grad_means norm)
     const float4 v_rot = is_zero_grad ? float4(0) : v_gauss.d.rotations;
     const float3 v_scale_act = is_zero_grad ? float3(0) : v_gauss.d.scales;     // dL/d(activated scale)
     const float v_opac_act = is_zero_grad ? 0.0 : v_gauss.d.opacities;          // dL/d(activated opacity)

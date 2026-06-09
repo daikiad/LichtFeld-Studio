@@ -150,16 +150,25 @@ namespace lfs::vis {
             int total_iters = 0;
             int current_iter = 0; // last completed iteration (0 = none yet)
             std::uint32_t adam_t = 1;
-            std::vector<double> grad_accum;
-            std::vector<int> grad_count;
+            // MRNF-style per-gaussian densification stats (reset each refine window):
+            //  refine_weight_max = per-window MAX screen-space gradient magnitude,
+            //  vis_count         = cumulative visibility count.
+            std::vector<float> refine_weight_max;
+            std::vector<float> vis_count;
             std::vector<float> vxy_host;
             std::vector<std::int32_t> radii_host;
+            // Densification (mirrors LichtFeld MRNF; see parameters.hpp densification block).
             int refine_every = 100;
             int start_refine = 500;
             int stop_refine = 0;
+            int grow_until_iter = 15000;
             std::size_t max_cap = 3'000'000;
             float min_opacity = 0.005f;
-            float grow_fraction = 0.05f;
+            float grow_fraction = 0.07f;
+            float growth_grad_threshold = 0.003f;
+            float opacity_decay = 0.004f;
+            float scale_decay = 0.002f;
+            float bounds_percentile = 0.8f;
             float last_loss = 0.0f;
             bool primed = false;
         };

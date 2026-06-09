@@ -804,6 +804,9 @@ void VulkanGSRenderer::executeFusedProjectionBackwardOptimizerSplit(
         g_shn2 = &resizeDeviceBuffer(buffers.g_shN_2, std::max<size_t>(shN_floats, 4));
     }
 
+    // Densification stat output: per-gaussian 3D means-gradient norm (MRNF growth signal).
+    _VulkanBuffer& g_gmn = resizeDeviceBuffer(buffers.grad_means_norm, N);
+
     executeCompute(
         {{N, SUBGROUP_SIZE}},
         &uniforms, sizeof(uniforms),
@@ -826,6 +829,7 @@ void VulkanGSRenderer::executeFusedProjectionBackwardOptimizerSplit(
             *g_op,                                     // 14
             *g_shn1,                                   // 15
             *g_shn2,                                   // 16
+            g_gmn,                                      // 17 out: ||dL/d means_ws|| per gaussian
         }));
 }
 
