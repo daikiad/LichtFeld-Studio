@@ -249,6 +249,12 @@ void VulkanGSRenderer::initializeExternal(const std::map<std::string, std::strin
     if (spirv_paths.count("l1_grad")) {
         createComputePipeline(pipeline_l1_grad, spirv_paths.at("l1_grad"));
     }
+    if (spirv_paths.count("ssim_forward") && spirv_paths.count("ssim_backward")) {
+        // ssim.slang declares all four groupshared tiles (~27KB) regardless of pass; skip on
+        // devices that can't provide it (caller falls back to L1).
+        createComputePipeline(pipeline_ssim_forward, spirv_paths.at("ssim_forward"), 27u * 1024u);
+        createComputePipeline(pipeline_ssim_backward, spirv_paths.at("ssim_backward"), 27u * 1024u);
+    }
     createComputePipeline(pipeline_cumsum.single_pass, spirv_paths.at("cumsum_single_pass"));
     createComputePipeline(pipeline_cumsum.block_scan, spirv_paths.at("cumsum_block_scan"));
     createComputePipeline(pipeline_cumsum.scan_block_sums, spirv_paths.at("cumsum_scan_block_sums"));
@@ -851,6 +857,49 @@ void VulkanGSRenderer::executeL1LossGradient(
             buffers.pixel_state.deviceBuffer, // 0  rendered accumulator
             buffers.train_gt.deviceBuffer,    // 1  ground truth
             v_out,                            // 2  out: dL/d(pixel_state)
+        }));
+}
+
+void VulkanGSRenderer::executeSSIMLossGradient(
+    const SSIMGradUniforms& uniforms, VulkanGSPipelineBuffers& buffers) {
+    DEVICE_GUARD;
+    if (pipeline_ssim_backward.shader == VK_NULL_HANDLE)
+        return; // unavailable (insufficient threadgroup memory); caller falls back to L1
+    const size_t P = static_cast<size_t>(uniforms.image_width) * uniforms.image_height;
+
+    bufferMemoryBarrier(
+        {
+            {buffers.pixel_state.deviceBuffer, COMPUTE_SHADER_WRITE},
+            {buffers.train_gt.deviceBuffer, TRANSFER_COMPUTE_SHADER_WRITE},
+        },
+        COMPUTE_SHADER_READ);
+    auto& v_out = resizeDeviceBuffer(buffers.v_current_pixel_state, 4 * P);
+    auto& smap = resizeDeviceBuffer(buffers.ssim_map, 4 * 3 * P); // 3 channels x float4
+
+    // Pass 1: forward -> ssim_map (+ partials). Binding 3 (v_out) is declared but unused here.
+    executeCompute(
+        {{uniforms.image_width, 16}, {uniforms.image_height, 16}},
+        &uniforms, sizeof(uniforms),
+        pipeline_ssim_forward,
+        std::vector<_VulkanBuffer>({
+            buffers.pixel_state.deviceBuffer, // 0  rendered
+            buffers.train_gt.deviceBuffer,    // 1  ground truth
+            smap,                             // 2  out: ssim map + partials
+            v_out,                            // 3  (unused in forward)
+        }));
+
+    bufferMemoryBarrier({{smap, COMPUTE_SHADER_WRITE}}, COMPUTE_SHADER_READ);
+
+    // Pass 2: backward -> v_current_pixel_state = combined (1-lambda)*L1 + lambda*(1-SSIM) gradient.
+    executeCompute(
+        {{uniforms.image_width, 16}, {uniforms.image_height, 16}},
+        &uniforms, sizeof(uniforms),
+        pipeline_ssim_backward,
+        std::vector<_VulkanBuffer>({
+            buffers.pixel_state.deviceBuffer, // 0  rendered
+            buffers.train_gt.deviceBuffer,    // 1  ground truth
+            smap,                             // 2  ssim map + partials (read)
+            v_out,                            // 3  out: dL/d(pixel_state)
         }));
 }
 

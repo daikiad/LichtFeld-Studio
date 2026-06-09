@@ -247,6 +247,8 @@ namespace lfs::vis {
                 {"fused_projection_backward_optimizer_split",
                  (root / "generated/fused_projection_backward_optimizer_split.spv").string()},
                 {"l1_grad", (root / "generated/l1_grad.spv").string()},
+                {"ssim_forward", (root / "generated/ssim_forward.spv").string()},
+                {"ssim_backward", (root / "generated/ssim_backward.spv").string()},
                 {"cumsum_single_pass", (root / "generated/cumsum_single_pass.spv").string()},
                 {"cumsum_block_scan", (root / "generated/cumsum_block_scan.spv").string()},
                 {"cumsum_scan_block_sums", (root / "generated/cumsum_scan_block_sums.spv").string()},
@@ -4169,7 +4171,21 @@ namespace lfs::vis {
                 ou.reg_opacity = regN > 0.0f ? 0.01f / regN : 0.0f;
             }
 
-            renderer_.executeL1LossGradient(lu, buffers_);
+            // Combined L1 + D-SSIM image loss (matches the CUDA trainer, lambda_dssim=0.2). The
+            // fused SSIM shader emits the weighted (1-lambda)*L1 + lambda*(1-SSIM) gradient in one
+            // pass into v_current_pixel_state. Fall back to pure L1 if SSIM is unavailable (e.g.
+            // insufficient threadgroup memory) or for tiny images where the 11x11 window degenerates.
+            constexpr float kLambdaDssim = 0.2f;
+            if (renderer_.hasSSIMLossGradient() && H > 10 && W > 10) {
+                SSIMGradUniforms su{};
+                su.image_width = static_cast<std::uint32_t>(W);
+                su.image_height = static_cast<std::uint32_t>(H);
+                su.grad_weight_l1 = (1.0f - kLambdaDssim) / static_cast<float>(3 * P);
+                su.grad_weight_ssim = -kLambdaDssim / static_cast<float>(3 * P); // loss = 1 - SSIM
+                renderer_.executeSSIMLossGradient(su, buffers_);
+            } else {
+                renderer_.executeL1LossGradient(lu, buffers_);
+            }
             renderer_.executeRasterizeBackward(last_uniforms_, buffers_);
             renderer_.executeFusedProjectionBackwardOptimizerSplit(ou, buffers_);
             ++st.adam_t;

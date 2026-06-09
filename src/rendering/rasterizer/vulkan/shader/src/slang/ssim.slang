@@ -37,7 +37,7 @@ static const uint numChannels = 3u;
 
 // Input/Output buffer declarations
 layout(binding=0) StructuredBuffer<float4> img1Buffer;
-layout(binding=1) StructuredBuffer<uint32_t> img2Buffer;
+layout(binding=1) StructuredBuffer<float4> img2Buffer; // ground truth, RGB in .xyz (matches train_gt)
 layout(binding=2) RWStructuredBuffer<float4> ssimMapBuffer;
 layout(binding=3) RWStructuredBuffer<float4> dLdimg1Buffer;
 
@@ -124,12 +124,11 @@ void ssimForward(
                 int gy = int(tileStartY + localY) - int(HALO);
                 int gx = int(tileStartX + localX) - int(HALO);
                 
-                float alpha;
                 float val1 = getPixelValue(img1Buffer, gx, gy, imageWidth, imageHeight)[ci];
-                float val2 = getPixelValue(img2Buffer, gx, gy, imageWidth, imageHeight, alpha)[ci];
-                
-                sTile[localY][localX][0] = val1 * alpha;
-                sTile[localY][localX][1] = val2 * alpha;
+                float val2 = getPixelValue(img2Buffer, gx, gy, imageWidth, imageHeight)[ci];
+
+                sTile[localY][localX][0] = val1;
+                sTile[localY][localX][1] = val2;
             }
         }
         
@@ -368,13 +367,12 @@ void ssimBackward(
             sum1 += sScratch[ly][lx][1] * wc;
             sum2 += sScratch[ly][lx][2] * wc;
             
-            float alpha;
             float p1 = float(getPixelValue(img1Buffer, pixX, pixY, imageWidth, imageHeight)[ci]);
-            float p2 = float(getPixelValue(img2Buffer, pixX, pixY, imageWidth, imageHeight, alpha)[ci]);
-            p1 *= alpha; p2 *= alpha;
+            float p2 = float(getPixelValue(img2Buffer, pixX, pixY, imageWidth, imageHeight)[ci]);
             float g_l1 = sign(p1 - p2) * gradWeightL1;
             float g_ssim = (sum0 + (2.0f * p1) * sum1 + p2 * sum2) * gradWeightSSIM;
-            float clampDerivative = (p1 > 0.0f) ? 1.0f : 0.0f;
+            // Match the L1 shader's two-sided clamp derivative (gradient only inside [0,1]).
+            float clampDerivative = (p1 > 0.0f && p1 < 1.0f) ? 1.0f : 0.0f;
             float dLdpix = (g_l1 + g_ssim) * clampDerivative;
             
             if (ci == 0) dLdimg1Buffer[pixId] = float4(float4(dLdpix, 0, 0, 0));

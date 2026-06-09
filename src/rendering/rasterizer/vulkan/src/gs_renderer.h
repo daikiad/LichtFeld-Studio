@@ -106,6 +106,13 @@ PACK_STRUCT(struct L1GradUniforms {
     uint32_t pad1;
 });
 
+PACK_STRUCT(struct SSIMGradUniforms {
+    uint32_t image_width;
+    uint32_t image_height;
+    float grad_weight_l1;   // (1-lambda)/(3*P): weighted mean-L1
+    float grad_weight_ssim; // -lambda/(3*P): weighted mean-(1-SSIM) (shader does not negate)
+});
+
 class VulkanGSRenderer : public VulkanGSPipeline {
 public:
     struct PrimitiveVisibilityStats {
@@ -199,6 +206,10 @@ public:
     // GPU image-space L1 loss gradient: reads pixel_state + buffers.train_gt, writes
     // v_current_pixel_state (no per-iteration CPU readback).
     void executeL1LossGradient(const L1GradUniforms& uniforms, VulkanGSPipelineBuffers& buffers);
+    // Combined L1+SSIM image-loss gradient -> v_current_pixel_state (no-op if the pipeline is
+    // unavailable, e.g. insufficient threadgroup memory; caller should fall back to L1).
+    void executeSSIMLossGradient(const SSIMGradUniforms& uniforms, VulkanGSPipelineBuffers& buffers);
+    [[nodiscard]] bool hasSSIMLossGradient() const { return pipeline_ssim_backward.shader != VK_NULL_HANDLE; }
 
 protected:
     void executeCumsum(
@@ -262,6 +273,8 @@ protected:
     _ComputePipelinePair pipeline_rasterize_backward_per_pixel = _ComputePipelinePair(11);
     _ComputePipeline pipeline_fused_projection_backward_optimizer_split = _ComputePipeline(18); // +grad_means_norm (binding 17)
     _ComputePipeline pipeline_l1_grad = _ComputePipeline(3);
+    _ComputePipeline pipeline_ssim_forward = _ComputePipeline(4);
+    _ComputePipeline pipeline_ssim_backward = _ComputePipeline(4);
     struct _CumsumComputePipeline {
         _ComputePipeline single_pass = _ComputePipeline(2);
         _ComputePipeline block_scan = _ComputePipeline(3);
