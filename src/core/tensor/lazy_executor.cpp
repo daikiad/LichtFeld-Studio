@@ -506,6 +506,11 @@ namespace lfs::core::internal {
             if (pure_scalar) {
                 const auto [a, b] = fold_affine(recipe.ops);
 
+#ifdef LFS_ENABLE_CUDA
+                // On no-CUDA builds every tensor is labeled Device::CUDA but is
+                // host-resident, and launch_fused_affine_transform is a no-op stub — taking
+                // this branch returns an uninitialized buffer. Compile it out so the CPU
+                // fallback below runs (the CUDA build is unchanged).
                 if (source.device() == Device::CUDA) {
                     const float* in_ptr = source.ptr<float>();
                     assert(in_ptr != nullptr);
@@ -519,6 +524,7 @@ namespace lfs::core::internal {
                     materialized = std::move(out);
                     return true;
                 }
+#endif
 
                 const float* in_ptr = source.ptr<float>();
                 if (in_ptr == nullptr)
@@ -542,6 +548,8 @@ namespace lfs::core::internal {
                 chain.ops[i].scalar = recipe.ops[i].scalar;
             }
 
+#ifdef LFS_ENABLE_CUDA
+            // See note above: skip the no-op stub path on no-CUDA so the CPU loop runs.
             if (source.device() == Device::CUDA) {
                 const float* in_ptr = source.ptr<float>();
                 assert(in_ptr != nullptr);
@@ -555,6 +563,7 @@ namespace lfs::core::internal {
                 materialized = std::move(out);
                 return true;
             }
+#endif
 
             const float* in_ptr = source.ptr<float>();
             if (in_ptr == nullptr)

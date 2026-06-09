@@ -663,6 +663,10 @@ namespace lfs::core {
 
         validate_unary_op();
 
+        // Fused transform-reduce fast-paths call no-op stub launchers on no-CUDA builds
+        // (every tensor is a host-resident Device::CUDA), so compile them out and fall to the
+        // normal materialize-then-reduce path below.
+#ifdef LFS_ENABLE_CUDA
         // Fused transform-reduce: consume pending pointwise chain
         if (dtype_ == DataType::Float32 &&
             device_ == Device::CUDA && has_lazy_expr() &&
@@ -779,6 +783,7 @@ namespace lfs::core {
                 }
             }
         }
+#endif // LFS_ENABLE_CUDA (fused transform-reduce fast-paths)
 
         // Materialize deferred tensors before the reduce kernels capture raw shape/data pointers.
         // data_ptr() triggers materialization which std::moves internal state; if shape pointers
@@ -2045,6 +2050,9 @@ namespace lfs::core {
         // FUSED VERSION: Allocate output + clamp in one pass (avoids separate clone)
         auto result = empty(shape_, device_, dtype_);
 
+        // launch_clamp_fused is a no-op stub on no-CUDA builds (where every tensor is a
+        // host-resident Device::CUDA), so compile the CUDA branch out and run the CPU loop.
+#ifdef LFS_ENABLE_CUDA
         if (device_ == Device::CUDA) {
             if (dtype_ == DataType::Float32) {
                 // Single-pass: read from source, write clamped to destination
@@ -2061,7 +2069,9 @@ namespace lfs::core {
                                                     static_cast<int>(max_val),
                                                     numel(), result.stream());
             }
-        } else {
+        } else
+#endif
+        {
             // CPU: simple loop
             if (dtype_ == DataType::Float32) {
                 const float* src = ptr<float>();
