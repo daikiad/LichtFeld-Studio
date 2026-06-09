@@ -3794,6 +3794,140 @@ namespace lfs::vis {
         return {};
     }
 
+    std::expected<void, std::string> VksplatViewportRenderer::runMultiCameraTraining(
+        VulkanContext& context,
+        lfs::core::SplatData& model,
+        const std::vector<lfs::rendering::ViewportRenderRequest>& requests,
+        const std::vector<std::vector<float>>& gts,
+        int iters) {
+        if (requests.empty() || requests.size() != gts.size()) {
+            return std::unexpected("runMultiCameraTraining: empty or mismatched requests/gts");
+        }
+        if (auto init = ensureInitialized(context); !init) {
+            return std::unexpected("runMultiCameraTraining: renderer init failed: " + init.error());
+        }
+        const std::size_t n_cams = requests.size();
+
+        const auto pixel_count = [&](std::size_t cam) -> std::size_t {
+            return static_cast<std::size_t>(requests[cam].frame_view.size.x) *
+                   static_cast<std::size_t>(requests[cam].frame_view.size.y);
+        };
+
+        // Prime all ring slots with the model (camera 0) so subsequent renders with
+        // force_input_upload=false keep the optimizer's in-place device updates.
+        for (int w = 0; w < static_cast<int>(kInputRingSize) + 1; ++w) {
+            auto r = render(context, model, requests[0], /*force_input_upload=*/true,
+                            OutputSlot::Main, /*synchronize_input_upload=*/false);
+            if (!r) {
+                return std::unexpected("multi-cam prime render failed: " + r.error());
+            }
+        }
+        if (buffers_.num_splats == 0) {
+            return std::unexpected("multi-cam: empty model");
+        }
+
+        // Pose sanity check: L1 of camera 0's initial render vs its GT (high/garbage =>
+        // wrong pose convention; should be moderate for a sensible init).
+        const auto log_l1 = [&](std::size_t cam, int step) {
+            auto cur = readOutputImageRgb8(context, OutputSlot::Main);
+            if (!cur || !*cur || !(*cur)->is_valid())
+                return;
+            const std::uint8_t* c = (*cur)->ptr<std::uint8_t>();
+            const std::size_t P = pixel_count(cam);
+            const std::vector<float>& gt = gts[cam];
+            if (gt.size() < 4 * P)
+                return;
+            double l1 = 0.0;
+            for (std::size_t p = 0; p < P; ++p)
+                for (int ch = 0; ch < 3; ++ch)
+                    l1 += std::abs(c[3 * p + ch] / 255.0f - gt[4 * p + ch]);
+            l1 /= static_cast<double>(3 * P);
+            LOG_WARN("vk-train step {:4d}  cam {:2d}  L1={:.6f}", step, static_cast<int>(cam), l1);
+        };
+        log_l1(0, 0);
+        LOG_WARN("vk-train: cam0 num_indices={} (0 => nothing visible; check pose/intrinsics) "
+                 "wv_t=({:.2f},{:.2f},{:.2f}) fx={:.1f} cx={:.1f} active_sh={} img={}x{}",
+                 buffers_.num_indices,
+                 last_uniforms_.world_view_transform[12], last_uniforms_.world_view_transform[13],
+                 last_uniforms_.world_view_transform[14], last_uniforms_.fx, last_uniforms_.cx,
+                 last_uniforms_.active_sh, last_uniforms_.image_width, last_uniforms_.image_height);
+
+        LOG_WARN("vk-train: {} cameras, {} splats, {} iters", n_cams, buffers_.num_splats, iters);
+
+        for (int step = 1; step <= iters; ++step) {
+            const std::size_t cam = static_cast<std::size_t>(step - 1) % n_cams;
+            auto r = render(context, model, requests[cam], /*force_input_upload=*/false,
+                            OutputSlot::Main, /*synchronize_input_upload=*/false);
+            if (!r) {
+                return std::unexpected("multi-cam render failed: " + r.error());
+            }
+            if (buffers_.num_indices == 0) {
+                if (step <= 3 || step % 50 == 0)
+                    LOG_WARN("vk-train step {:4d} cam {:2d}: num_indices=0, skipping", step, static_cast<int>(cam));
+                continue;
+            }
+            const std::size_t H = last_uniforms_.image_height;
+            const std::size_t W = last_uniforms_.image_width;
+            const std::size_t P = H * W;
+            if (gts[cam].size() < 4 * P) {
+                return std::unexpected("multi-cam: GT smaller than render");
+            }
+
+            // Upload this camera's GT, then GPU loss -> backward -> Adam.
+            auto& gtbuf = renderer_.resizeDeviceBuffer(buffers_.train_gt, 4 * P);
+            renderer_.uploadHostBufferToDevice(gtbuf, gts[cam].data(), 4 * P * sizeof(float));
+
+            L1GradUniforms lu{};
+            lu.num_pixels = static_cast<std::uint32_t>(P);
+            lu.inv_scale = 1.0f / static_cast<float>(3 * P);
+
+            FusedSplitOptimizerUniforms ou{};
+            ou.step = static_cast<std::uint32_t>(step);
+            ou.active_sh = last_uniforms_.active_sh | (last_uniforms_.camera_model << 8);
+            ou.num_splats = static_cast<std::uint32_t>(buffers_.num_splats);
+            ou.image_size = (static_cast<std::uint32_t>(H) << 16) | static_cast<std::uint32_t>(W);
+            ou.shN_slots_per_primitive = last_uniforms_.shN_layout_slots;
+            ou.fx = last_uniforms_.fx;
+            ou.fy = last_uniforms_.fy;
+            ou.cx = last_uniforms_.cx;
+            ou.cy = last_uniforms_.cy;
+            for (int i = 0; i < 4; ++i)
+                ou.dist_coeffs[i] = last_uniforms_.dist_coeffs[i];
+            for (int i = 0; i < 16; ++i)
+                ou.world_view_transform[i] = last_uniforms_.world_view_transform[i];
+            ou.lr_means = 1.6e-4f;
+            ou.lr_quats = 1.0e-3f;
+            ou.lr_scales = 5.0e-3f;
+            ou.lr_opacities = 5.0e-2f;
+            ou.lr_sh_dc = 2.5e-3f;
+            ou.lr_sh_rest = 1.25e-4f;
+            ou.reg_scale = 0.0f;
+            ou.reg_opacity = 0.0f;
+
+            renderer_.executeL1LossGradient(lu, buffers_);
+            renderer_.executeRasterizeBackward(last_uniforms_, buffers_);
+            renderer_.executeFusedProjectionBackwardOptimizerSplit(ou, buffers_);
+
+            if (step == 1 || step % 50 == 0 || step == iters) {
+                log_l1(cam, step);
+            }
+        }
+
+        // Read the optimizer-updated raw params out of the owned device buffers back into
+        // the model so it can be saved (the host-copy input path does NOT alias them).
+        const auto write_back = [&](const _VulkanBuffer& dev, lfs::core::Tensor& t) {
+            renderer_.downloadDeviceBufferToHost(dev, t.ptr<float>(),
+                                                 static_cast<std::size_t>(t.numel()) * sizeof(float));
+        };
+        write_back(buffers_.xyz_ws.deviceBuffer, model.means_raw());
+        write_back(buffers_.sh0.deviceBuffer, model.sh0());
+        write_back(buffers_.shN.deviceBuffer, model.shN());
+        write_back(buffers_.rotations.deviceBuffer, model.rotation_raw());
+        write_back(buffers_.scaling_raw.deviceBuffer, model.scaling_raw());
+        write_back(buffers_.opacity_raw.deviceBuffer, model.opacity_raw());
+        return {};
+    }
+
     std::expected<void, std::string> VksplatViewportRenderer::readOutputImageIntoCpuHwc(
         VulkanContext& context,
         const OutputSlot output_slot,

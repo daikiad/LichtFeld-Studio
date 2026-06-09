@@ -51,6 +51,11 @@ public:
     // barrier). Self-contained: records and submits its own command batch and waits.
     // Used by the macOS/no-interop input path to feed splat inputs without CUDA.
     void uploadHostBufferToDevice(_VulkanBuffer& dst, const void* src, size_t bytes);
+    // Reverse of uploadHostBufferToDevice: copy `bytes` from a device buffer back to
+    // host memory via the shared staging buffer. Used by the no-CUDA trainer to read
+    // the optimizer-updated raw params out of the owned device buffers (which the
+    // host-copy input path does NOT alias to the SplatData tensors) before saving.
+    void downloadDeviceBufferToHost(const _VulkanBuffer& src, void* dst, size_t bytes);
     void resizeDeviceBuffer(_VulkanBuffer& deviceBuffer, size_t new_byte_size, bool no_shrink = true);
     template <typename T>
     _VulkanBuffer& resizeDeviceBuffer(Buffer<T>& buffer, size_t new_size, bool no_shrink = true);

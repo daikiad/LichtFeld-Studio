@@ -281,6 +281,39 @@ void VulkanGSPipeline::uploadHostBufferToDevice(_VulkanBuffer& dst, const void* 
     }
 }
 
+void VulkanGSPipeline::downloadDeviceBufferToHost(const _VulkanBuffer& src, void* dst, size_t bytes) {
+    if (bytes == 0)
+        return;
+    if (dst == nullptr)
+        _THROW_ERROR("downloadDeviceBufferToHost received a null destination pointer");
+    if (src.buffer == VK_NULL_HANDLE)
+        _THROW_ERROR("downloadDeviceBufferToHost source buffer is not allocated");
+    if (src.size < bytes)
+        _THROW_ERROR("downloadDeviceBufferToHost source is smaller than the requested size");
+
+    allocStagingBuffer(bytes);
+    {
+        {
+            DEVICE_GUARD;
+            // Make the optimizer's compute writes visible to the transfer read.
+            bufferMemoryBarrier({{src, COMPUTE_SHADER_WRITE}}, TRANSFER_READ);
+            VkBufferCopy copyRegion = {};
+            copyRegion.srcOffset = src.offset;
+            copyRegion.dstOffset = 0;
+            copyRegion.size = bytes;
+            vkCmdCopyBuffer(command_buffer, src.buffer, stager.buffer, 1, &copyRegion);
+        }
+        HOST_GUARD; // applies the fence
+
+        void* base = nullptr;
+        if (vmaMapMemory(allocator, stager.allocation, &base) != VK_SUCCESS)
+            _THROW_ERROR("downloadDeviceBufferToHost failed to map the staging buffer");
+        vmaInvalidateAllocation(allocator, stager.allocation, 0, bytes);
+        memcpy(dst, base, bytes);
+        vmaUnmapMemory(allocator, stager.allocation);
+    }
+}
+
 template <typename T>
 _VulkanBuffer& VulkanGSPipeline::resizeDeviceBuffer(Buffer<T>& buffer, size_t new_size, bool no_shrink) {
     auto& deviceBuffer = buffer.deviceBuffer;

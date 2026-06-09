@@ -127,6 +127,17 @@ namespace lfs::vis {
             const lfs::core::SplatData& splat_data,
             const lfs::rendering::ViewportRenderRequest& request,
             int iters);
+
+        // No-CUDA Vulkan multi-camera training: trains `model` (updated in place at the
+        // end via device->host read-back) against per-camera ground-truth images for
+        // `iters` round-robin steps. requests[i]/gts[i] describe camera i (gts[i] is HWC
+        // float4, sized to that camera's render resolution). Logs L1 periodically.
+        [[nodiscard]] std::expected<void, std::string> runMultiCameraTraining(
+            VulkanContext& context,
+            lfs::core::SplatData& model,
+            const std::vector<lfs::rendering::ViewportRenderRequest>& requests,
+            const std::vector<std::vector<float>>& gts,
+            int iters);
         [[nodiscard]] std::expected<std::shared_ptr<lfs::core::Tensor>, std::string> readOutputImage(
             VulkanContext& context,
             OutputSlot output_slot = OutputSlot::Main) const;
