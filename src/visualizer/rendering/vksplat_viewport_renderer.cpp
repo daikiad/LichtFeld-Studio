@@ -1119,6 +1119,12 @@ namespace lfs::vis {
                         row_major_view[static_cast<std::size_t>(4 * col + row)];
                 }
             }
+
+            // Headless override: feed a precomputed world->view matrix verbatim.
+            if (frame_view.world_view_override) {
+                for (int i = 0; i < 16; ++i)
+                    uniforms.world_view_transform[i] = (*frame_view.world_view_override)[i];
+            }
         }
 
         struct ComposePushConstants {
@@ -3794,6 +3800,16 @@ namespace lfs::vis {
         return {};
     }
 
+    std::size_t VksplatViewportRenderer::probeNumIndices(
+        VulkanContext& context,
+        const lfs::core::SplatData& model,
+        const lfs::rendering::ViewportRenderRequest& request) {
+        if (auto init = ensureInitialized(context); !init)
+            return 0;
+        auto r = render(context, model, request, /*force_input_upload=*/true, OutputSlot::Main, false);
+        return r ? buffers_.num_indices : 0;
+    }
+
     std::expected<void, std::string> VksplatViewportRenderer::runMultiCameraTraining(
         VulkanContext& context,
         lfs::core::SplatData& model,
@@ -3806,6 +3822,8 @@ namespace lfs::vis {
         if (auto init = ensureInitialized(context); !init) {
             return std::unexpected("runMultiCameraTraining: renderer init failed: " + init.error());
         }
+
+
         const std::size_t n_cams = requests.size();
 
         const auto pixel_count = [&](std::size_t cam) -> std::size_t {
@@ -3908,7 +3926,7 @@ namespace lfs::vis {
             renderer_.executeRasterizeBackward(last_uniforms_, buffers_);
             renderer_.executeFusedProjectionBackwardOptimizerSplit(ou, buffers_);
 
-            if (step == 1 || step % 50 == 0 || step == iters) {
+            if (cam == 0 || step == iters) { // cam 0 each cycle => comparable convergence signal
                 log_l1(cam, step);
             }
         }

@@ -6,6 +6,7 @@
 
 #include "coordinate_conventions.hpp"
 #include "render_constants.hpp"
+#include <array>
 #include <glm/glm.hpp>
 #include <optional>
 
@@ -36,6 +37,11 @@ namespace lfs::rendering {
         bool orthographic = false;
         float ortho_scale = DEFAULT_ORTHO_SCALE;
         glm::vec3 background_color{0.0f, 0.0f, 0.0f};
+        // Headless no-CUDA path: inject a precomputed world->view matrix directly into the
+        // renderer uniforms (column-major, the layout populateVksplatCameraUniforms emits),
+        // bypassing the visualizer rotation/translation conversion. Used by --vk-train to
+        // feed the dataset Camera's authoritative world_view_transform.
+        std::optional<std::array<float, 16>> world_view_override;
 
         [[nodiscard]] glm::mat4 getViewMatrix() const {
             return makeViewMatrix(rotation, translation);

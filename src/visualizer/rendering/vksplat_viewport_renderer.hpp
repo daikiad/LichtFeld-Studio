@@ -138,6 +138,13 @@ namespace lfs::vis {
             const std::vector<lfs::rendering::ViewportRenderRequest>& requests,
             const std::vector<std::vector<float>>& gts,
             int iters);
+        // Diagnostic: render once (force upload) and return the resulting num_indices
+        // (tile-instance count). Used to brute-force the dataset-camera pose convention.
+        [[nodiscard]] std::size_t probeNumIndices(
+            VulkanContext& context,
+            const lfs::core::SplatData& model,
+            const lfs::rendering::ViewportRenderRequest& request);
+
         [[nodiscard]] std::expected<std::shared_ptr<lfs::core::Tensor>, std::string> readOutputImage(
             VulkanContext& context,
             OutputSlot output_slot = OutputSlot::Main) const;

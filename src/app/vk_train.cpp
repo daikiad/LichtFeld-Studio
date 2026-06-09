@@ -96,6 +96,8 @@ namespace lfs::app {
             return 1;
         }
 
+        lfs::vis::VksplatViewportRenderer vk;
+
         // Build per-camera ground-truth (HWC float4, normalized) + render requests.
         std::vector<lfs::rendering::ViewportRenderRequest> requests;
         std::vector<std::vector<float>> gts;
@@ -128,26 +130,29 @@ namespace lfs::app {
                 continue;
             }
 
-            // Render in DATA (COLMAP) world space so the raw SplatData means line up with
-            // the dataset cameras. buildGTRenderCamera bakes a data->visualizer axis flip
-            // into the pose for the GUI (which applies the same flip to the splats via the
-            // scene-node transform); our backward optimizes the RAW means with an identity
-            // model transform, so we must NOT flip. Reconstruct the pose so getViewMatrix()
-            // reproduces the dataset's world->camera matrix directly.
-            // cam.R() is the camera->world rotation (loader stores transpose(w2c)); cam.T()
-            // is the world->camera translation. frame_view.rotation/translation are the
-            // camera->world pose makeViewMatrix() inverts, so: rotation = R_c2w,
-            // translation = camera position = -R_c2w * T.
-            auto R_cpu = cam->R().cpu().contiguous();
-            auto T_cpu = cam->T().cpu().contiguous();
-            const glm::mat3 R_c2w = lfs::rendering::mat3FromRowMajor3x3(R_cpu.ptr<float>());
-            const glm::vec3 Tw(T_cpu.ptr<float>()[0], T_cpu.ptr<float>()[1], T_cpu.ptr<float>()[2]);
-            const glm::vec3 cam_pos = -(R_c2w * Tw);
+            // Feed the dataset Camera's authoritative world_view_transform straight into the
+            // renderer (bypassing the visualizer rotation/translation conversion). Two pieces:
+            //  1. cam->world_view_transform() is the row-major [R_w2c | T] the reference
+            //     rasterizer uses; the Vulkan shader wants it in column-major, so transpose
+            //     (override[4r+c] = wp[4c+r]).
+            //  2. The NeRF loader flips the point cloud by diag(1,-1,-1) but the cameras end up
+            //     in diag(-1,-1,1)*P_blender, so the loaded means are diag(-1,1,-1) (negate x,z)
+            //     off from the cameras. Compose that world flip into the view matrix
+            //     (post-multiply by F = diag(-1,1,-1,1) == negate rows 0,2 of the transposed
+            //     matrix) so the raw means project correctly and the saved PLY stays in the
+            //     loader's basis.
+            auto wvt = cam->world_view_transform().squeeze(0).cpu().contiguous();
+            const float* wp = wvt.ptr<float>();
+            std::array<float, 16> wv{};
+            for (int r = 0; r < 4; ++r) {
+                const float s = (r == 0 || r == 2) ? -1.0f : 1.0f; // F = diag(-1,1,-1,1)
+                for (int c = 0; c < 4; ++c)
+                    wv[4 * r + c] = s * wp[4 * c + r];
+            }
 
             lfs::rendering::ViewportRenderRequest req;
             req.frame_view.size = glm::ivec2{W, H};
-            req.frame_view.rotation = R_c2w;
-            req.frame_view.translation = cam_pos;
+            req.frame_view.world_view_override = wv;
             req.frame_view.intrinsics_override = rc->intrinsics;
             req.frame_view.background_color = glm::vec3(0.0f);
             req.transparent_background = false;
@@ -186,7 +191,6 @@ namespace lfs::app {
         const int iters = static_cast<int>(params->optimization.iterations);
         LOG_INFO("vk-train: training {} cameras for {} iterations", requests.size(), iters);
 
-        lfs::vis::VksplatViewportRenderer vk;
         auto trained = vk.runMultiCameraTraining(*ctx, *sd, requests, gts, iters);
         if (!trained) {
             LOG_ERROR("vk-train: training failed: {}", trained.error());
