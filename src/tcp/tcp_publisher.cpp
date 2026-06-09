@@ -58,7 +58,7 @@ namespace lfs::core::events::state {
                                      send(makeEventMessage(e, #Type));                             \
                                  })]() {                                                           \
         ::lfs::event::EventBridge::instance().unsubscribe(                                         \
-            typeid(lfs::core::events::state::Type), id);                                           \
+            typeid(lfs::core::events::state::Type).name(), id);                                     \
     })
 
 namespace lfs::tcp {

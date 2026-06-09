@@ -20,7 +20,7 @@ namespace lfs::event {
         template <typename E>
         void subscribe(std::function<void(const E&)> handler) {
             auto id = when<E>(std::move(handler));
-            cleanup_.push_back([id]() { EventBridge::instance().unsubscribe(typeid(E), id); });
+            cleanup_.push_back([id]() { EventBridge::instance().unsubscribe(typeid(E).name(), id); });
         }
 
         void subscribe_hook(lfs::training::ControlHook hook,

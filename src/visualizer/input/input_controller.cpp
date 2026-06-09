@@ -344,7 +344,7 @@ namespace lfs::vis {
         auto unsubscribe = [](const auto event_tag, std::size_t& handler_id) {
             if (handler_id == 0)
                 return;
-            ::lfs::event::EventBridge::instance().unsubscribe(typeid(decltype(event_tag)), handler_id);
+            ::lfs::event::EventBridge::instance().unsubscribe(typeid(decltype(event_tag)).name(), handler_id);
             handler_id = 0;
         };
 

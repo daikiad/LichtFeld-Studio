@@ -11,14 +11,14 @@ namespace lfs::event {
         return bridge;
     }
 
-    HandlerId EventBridge::subscribe(std::type_index type, Handler handler) {
+    HandlerId EventBridge::subscribe(const std::string& type, Handler handler) {
         std::lock_guard lock(mutex_);
         const HandlerId id = next_id_++;
         handlers_[type].emplace_back(id, std::move(handler));
         return id;
     }
 
-    void EventBridge::unsubscribe(std::type_index type, const HandlerId id) {
+    void EventBridge::unsubscribe(const std::string& type, const HandlerId id) {
         std::lock_guard lock(mutex_);
         auto it = handlers_.find(type);
         if (it == handlers_.end()) {
@@ -29,7 +29,7 @@ namespace lfs::event {
                   vec.end());
     }
 
-    void EventBridge::emit(std::type_index type, const void* data) {
+    void EventBridge::emit(const std::string& type, const void* data) {
         std::vector<Handler> handlers_copy;
         {
             std::lock_guard lock(mutex_);
@@ -46,7 +46,7 @@ namespace lfs::event {
         }
     }
 
-    size_t EventBridge::handler_count(std::type_index type) const {
+    size_t EventBridge::handler_count(const std::string& type) const {
         std::lock_guard lock(mutex_);
         auto it = handlers_.find(type);
         return it != handlers_.end() ? it->second.size() : 0;
