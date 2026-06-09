@@ -170,6 +170,14 @@ namespace lfs::io {
         float fl_x = -1, fl_y = -1;
         auto camera_model = lfs::core::CameraModelType::PINHOLE;
 
+        // nerfstudio / colmap2nerf datasets put intrinsics PER FRAME (fl_x/fl_y/cx/cy/w/h
+        // inside each frame) rather than at the top level. Detect that so we don't fall
+        // back to the equirectangular dummy below, and read them per camera in the loop.
+        const bool has_per_frame_intrinsics =
+            transforms.contains("frames") && transforms["frames"].is_array() &&
+            !transforms["frames"].empty() && transforms["frames"][0].is_object() &&
+            transforms["frames"][0].contains("fl_x");
+
         // Parse explicit camera_model field (nerfstudio format)
         if (transforms.contains("camera_model")) {
             const std::string model_str = transforms["camera_model"];
@@ -195,7 +203,8 @@ namespace lfs::io {
             fl_y = fov_rad_to_focal_length(h, float(transforms["camera_angle_y"]));
         } else {
             const bool no_intrinsics = !transforms.contains("fl_x") && !transforms.contains("camera_angle_x") &&
-                                       !transforms.contains("fl_y") && !transforms.contains("camera_angle_y");
+                                       !transforms.contains("fl_y") && !transforms.contains("camera_angle_y") &&
+                                       !has_per_frame_intrinsics;
             if (no_intrinsics) {
                 // Auto-detect equirectangular if not explicitly set
                 if (camera_model != lfs::core::CameraModelType::EQUIRECTANGULAR) {
@@ -203,13 +212,14 @@ namespace lfs::io {
                     camera_model = lfs::core::CameraModelType::EQUIRECTANGULAR;
                 }
                 fl_x = fl_y = EQUIRECTANGULAR_DUMMY_FOCAL;
-            } else {
+            } else if (!has_per_frame_intrinsics) {
                 // Blender format: square images use same focal for x/y
                 if (w != h) {
                     throw std::runtime_error("No camera_angle_y but w!=h");
                 }
                 fl_y = fl_x;
             }
+            // else: per-frame intrinsics are read in the frame loop below.
         }
 
         // Equirectangular needs dummy focal lengths if not set
@@ -329,25 +339,43 @@ namespace lfs::io {
 
                 camdata._image_name = lfs::core::path_to_utf8(camdata._image_path.filename());
 
-                camdata._width = w;
-                camdata._height = h;
+                // Per-frame intrinsics (nerfstudio/colmap2nerf) override the global ones.
+                const auto jget = [&](const char* key, float fallback) -> float {
+                    return frame.contains(key) ? float(frame[key]) : fallback;
+                };
+                const int f_w = frame.contains("w") ? int(frame["w"]) : w;
+                const int f_h = frame.contains("h") ? int(frame["h"]) : h;
+                const float f_fl_x = jget("fl_x", fl_x);
+                const float f_fl_y = frame.contains("fl_y") ? float(frame["fl_y"]) : (frame.contains("fl_x") ? f_fl_x : fl_y);
+                const float f_cx = jget("cx", cx >= 0 ? cx : 0.5f * f_w);
+                const float f_cy = jget("cy", cy >= 0 ? cy : 0.5f * f_h);
+                const float f_k1 = jget("k1", k1);
+                const float f_k2 = jget("k2", k2);
+                const float f_k3 = jget("k3", k3);
+                const float f_p1 = jget("p1", p1);
+                const float f_p2 = jget("p2", p2);
+                const bool f_distorted = (f_k1 != 0.0f) || (f_k2 != 0.0f) || (f_k3 != 0.0f) ||
+                                         (f_p1 != 0.0f) || (f_p2 != 0.0f);
+
+                camdata._width = f_w;
+                camdata._height = f_h;
 
                 camdata._T = T.contiguous();
                 camdata._R = R.contiguous();
 
-                if (is_distorted) {
-                    camdata._radial_distortion = Tensor::from_vector({k1, k2, k3}, {3}, Device::CPU);
-                    camdata._tangential_distortion = Tensor::from_vector({p1, p2}, {2}, Device::CPU);
+                if (f_distorted) {
+                    camdata._radial_distortion = Tensor::from_vector({f_k1, f_k2, f_k3}, {3}, Device::CPU);
+                    camdata._tangential_distortion = Tensor::from_vector({f_p1, f_p2}, {2}, Device::CPU);
                 } else {
                     camdata._radial_distortion = Tensor::empty({0}, Device::CPU);
                     camdata._tangential_distortion = Tensor::empty({0}, Device::CPU);
                 }
 
-                camdata._focal_x = fl_x;
-                camdata._focal_y = fl_y;
+                camdata._focal_x = f_fl_x;
+                camdata._focal_y = f_fl_y;
 
-                camdata._center_x = cx;
-                camdata._center_y = cy;
+                camdata._center_x = f_cx;
+                camdata._center_y = f_cy;
 
                 camdata._camera_model_type = camera_model;
                 camdata._camera_ID = static_cast<uint32_t>(counter++);
