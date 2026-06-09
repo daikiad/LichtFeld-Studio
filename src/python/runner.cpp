@@ -714,6 +714,12 @@ _add_dll_dirs()
     }
 
     void ensure_builtin_ui_registered() {
+        // Cheap fast-path so this is safe to call every frame / on every menu click until
+        // registration succeeds (it can be deferred at startup until both Python and the
+        // RmlUI runtime are ready).
+        if (g_builtin_ui_ready.load(std::memory_order_acquire)) {
+            return;
+        }
         ensure_initialized();
         if (!can_acquire_gil()) {
             LOG_WARN("Python GIL state not ready, skipping builtin UI registration");

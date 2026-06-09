@@ -50,6 +50,7 @@
 #include "core/scene.hpp"
 #include "python/package_manager.hpp"
 #include "python/python_runtime.hpp"
+#include "python/runner.hpp"
 #include "python/ui_hooks.hpp"
 #include "rendering/coordinate_conventions.hpp"
 #include "rendering/cuda_vulkan_interop.hpp"
@@ -3131,6 +3132,11 @@ namespace lfs::vis::gui {
             }
         });
         lfs::python::set_rml_manager(&rmlui_manager_);
+        // Builtin-UI (operators + panels) registration is gated on the RmlUI runtime being
+        // available; register NOW that it is, so it can't lose a startup-order race with the
+        // earlier deferred attempt (which left File-menu operators unregistered -> menu clicks
+        // logged "Operator not found"). Idempotent.
+        lfs::python::ensure_builtin_ui_registered();
         initDevResourceHotReload();
 
         startup_overlay_.init(&rmlui_manager_);

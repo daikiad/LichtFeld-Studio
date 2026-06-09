@@ -11,6 +11,7 @@
 #include "internal/resource_paths.hpp"
 #include "operator/operator_registry.hpp"
 #include "python/python_runtime.hpp"
+#include "python/runner.hpp"
 #include "theme/theme.hpp"
 
 #include <RmlUi/Core.h>
@@ -464,6 +465,10 @@ namespace lfs::vis::gui {
                                     if (action == "operator") {
                                         const std::string op_id = clicked->GetAttribute<Rml::String>("data-operator-id", "");
                                         if (!op_id.empty() && !clicked->HasAttribute("disabled")) {
+                                            // Guarantee builtin operators are registered before
+                                            // dispatch (registration can lose a startup-order race
+                                            // with the deferred attempt). Idempotent + cheap.
+                                            lfs::python::ensure_builtin_ui_registered();
                                             op::operators().invoke(op_id);
                                         }
                                         closeDropdown();
