@@ -4158,8 +4158,16 @@ namespace lfs::vis {
             ou.lr_opacities = 5.0e-2f;
             ou.lr_sh_dc = 2.5e-3f;
             ou.lr_sh_rest = 1.25e-4f;
-            ou.reg_scale = 0.0f;
-            ou.reg_opacity = 0.0f;
+            // Match the CUDA trainer's regularization (parameters.hpp scale_reg/opacity_reg=0.01).
+            // The CUDA kernel uses loss = weight*mean(.) so the per-element gradient is
+            // (weight/n)*activation (regularization.cu:92, n = numel). The optimizer shader applies
+            // reg*activation per element, so reg = weight/n: scaling has N*3 elements, opacity N.
+            // Without this large/low-contribution floaters grow unchecked.
+            {
+                const float regN = static_cast<float>(buffers_.num_splats);
+                ou.reg_scale = regN > 0.0f ? 0.01f / (3.0f * regN) : 0.0f;
+                ou.reg_opacity = regN > 0.0f ? 0.01f / regN : 0.0f;
+            }
 
             renderer_.executeL1LossGradient(lu, buffers_);
             renderer_.executeRasterizeBackward(last_uniforms_, buffers_);
