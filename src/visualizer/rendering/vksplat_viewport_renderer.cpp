@@ -3971,6 +3971,27 @@ namespace lfs::vis {
                 auto new_canon = gatherClone(canon);
                 model.shN_set_from_canonical(new_canon, new_N);
             }
+
+            // Break clone symmetry: offset each cloned copy's position by ~1 sigma (its world
+            // scale = exp(scaling_raw)) in a random direction. Exact duplicates share the same
+            // gradient and never diverge, so without this the clone is a near no-op (and the
+            // doubled density pops). Offsetting lets the two splats fill detail independently.
+            if (!clone.empty()) {
+                auto m_cpu = model.means_raw().cpu().contiguous();
+                auto s_cpu = model.scaling_raw().cpu().contiguous();
+                float* mp = m_cpu.ptr<float>();
+                const float* scp = s_cpu.ptr<float>();
+                std::mt19937 rng(static_cast<std::uint32_t>(step) * 2654435761u + 12345u);
+                std::uniform_real_distribution<float> uni(-1.0f, 1.0f);
+                for (std::size_t c = 0; c < clone.size(); ++c) {
+                    const std::size_t r = keep.size() + c;
+                    mp[3 * r + 0] += uni(rng) * std::exp(scp[3 * r + 0]);
+                    mp[3 * r + 1] += uni(rng) * std::exp(scp[3 * r + 1]);
+                    mp[3 * r + 2] += uni(rng) * std::exp(scp[3 * r + 2]);
+                }
+                model.means_raw() = m_cpu.to(model.means_raw().device());
+            }
+
             grad_accum.assign(new_N, 0.0);
             grad_count.assign(new_N, 0);
             for (int w = 0; w < static_cast<int>(kInputRingSize) + 1; ++w)
