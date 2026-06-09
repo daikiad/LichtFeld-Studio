@@ -1392,6 +1392,10 @@ namespace lfs::vis {
             .loss = st.last_loss,
             .num_gaussians = gaussians}
             .emit();
+        // Push the progress through the Python signal bridge too: the RmlUI training panel's
+        // reactive signals only refresh (and the panel only redraws) via this path; the C++
+        // app-store write alone doesn't notify them. Mirrors what the CUDA trainer relies on.
+        python::update_training_progress(st.current_iter, st.last_loss, static_cast<std::size_t>(gaussians));
         // Periodic host read-back for the gaussian-count UI + eventual save; the viewport
         // itself renders the device buffers directly so it stays live without this.
         if (st.current_iter % 100 == 0)
