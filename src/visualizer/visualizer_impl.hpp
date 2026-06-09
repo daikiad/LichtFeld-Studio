@@ -41,6 +41,7 @@ namespace lfs::vis {
 
 namespace lfs::vis {
     class DataLoadingService;
+    class VulkanContext;
 
     namespace tools {
         class AlignTool;
@@ -152,6 +153,13 @@ namespace lfs::vis {
         void shutdown();
         bool allowclose();
         void wakeMainLoop() const;
+
+        // No-CUDA Vulkan training, stepped from the render loop so the viewport shows progress
+        // live. State is pimpl'd to keep the renderer header out of this one.
+        struct VkTrainSession;
+        std::unique_ptr<VkTrainSession> vk_session_;
+        void driveVkTraining(VulkanContext* ctx);
+        bool buildVkTrainSession(VkTrainSession& session);
 
         // Event system
         void setupEventHandlers();

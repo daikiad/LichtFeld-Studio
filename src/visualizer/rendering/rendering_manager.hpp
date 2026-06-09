@@ -109,6 +109,10 @@ namespace lfs::vis {
         void renderFrame(const RenderContext& context);
         VulkanFrameResult renderVulkanFrame(const RenderContext& context);
 
+        // Borrowed access to the Vulkan splat renderer (no-CUDA Vulkan training drives it
+        // a few steps per frame and the viewport presents its in-place-updated buffers).
+        [[nodiscard]] VksplatViewportRenderer* vksplatRenderer() { return vksplat_viewport_renderer_.get(); }
+
         enum class VksplatSelectionMaskShape : std::uint32_t {
             Brush = 0,
             Rectangle = 1,

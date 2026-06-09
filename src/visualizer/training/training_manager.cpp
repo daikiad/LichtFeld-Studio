@@ -173,14 +173,47 @@ namespace lfs::vis {
 
     void TrainerManager::updateResourceTracking() {
         TrainingResources resources;
-        resources.has_trainer = trainer_ != nullptr;
+        resources.has_trainer = (trainer_ != nullptr) || vk_trainable_;
         resources.has_training_thread = training_thread_ != nullptr && training_thread_->joinable();
         resources.has_scene_data = scene_ != nullptr;
-        resources.has_gpu_tensors = trainer_ && trainer_->isInitialized();
+        resources.has_gpu_tensors = (trainer_ && trainer_->isInitialized()) || vk_trainable_;
         if (scene_) {
             resources.training_node_name = scene_->getTrainingModelNodeName();
         }
         state_machine_.setResources(resources);
+    }
+
+    void TrainerManager::setVkTrainable(const lfs::core::param::TrainingParameters& params) {
+        vk_trainable_ = true;
+        vk_active_ = false;
+        vk_params_ = params;
+        vk_total_iters_ = params.optimization.iterations > 0
+                              ? static_cast<int>(params.optimization.iterations)
+                              : 30000;
+        updateResourceTracking();
+        LOG_INFO("No-CUDA Vulkan training enabled ({} iterations planned)", vk_total_iters_);
+    }
+
+    void TrainerManager::finishVkTraining(bool success) {
+        if (!vk_active_)
+            return;
+        vk_active_ = false;
+        {
+            std::lock_guard<std::mutex> lock(completion_mutex_);
+            training_complete_ = true;
+        }
+        state::TrainingCompleted{
+            .iteration = vk_total_iters_,
+            .final_loss = 0.0f,
+            .elapsed_seconds = 0.0f,
+            .success = success,
+            .user_stopped = false,
+            .error = success ? std::string{} : std::string("Vulkan training error")}
+            .emit();
+        if (!state_machine_.transitionToFinished(success ? FinishReason::Completed : FinishReason::Error)) {
+            LOG_WARN("Failed to transition to Finished (vk)");
+        }
+        LOG_INFO("Vulkan training finished (success={})", success);
     }
 
     TrainerManager::~TrainerManager() {
@@ -288,6 +321,26 @@ namespace lfs::vis {
         }
 
         if (!trainer_) {
+            if (vk_trainable_) {
+                // No-CUDA Vulkan training: there is no CUDA Trainer object; the viewer's
+                // render loop steps VksplatViewportRenderer a few iterations per frame and the
+                // viewport presents the in-place-updated device buffers (live progress).
+                {
+                    std::lock_guard<std::mutex> lock(completion_mutex_);
+                    training_complete_ = false;
+                }
+                updateResourceTracking();
+                if (!state_machine_.transitionTo(TrainingState::Running)) {
+                    LOG_WARN("Failed to transition to Running (vk)");
+                    return false;
+                }
+                training_start_time_ = std::chrono::steady_clock::now();
+                accumulated_training_time_ = std::chrono::steady_clock::duration{0};
+                vk_active_ = true;
+                state::TrainingStarted{.total_iterations = vk_total_iters_}.emit();
+                LOG_INFO("Vulkan (no-CUDA) training started - {} iterations planned", vk_total_iters_);
+                return true;
+            }
             LOG_ERROR("Cannot start training - no trainer available");
             return false;
         }
@@ -632,6 +685,7 @@ namespace lfs::vis {
         }
 
         LOG_DEBUG("Requesting training stop");
+        vk_active_ = false; // VK path: viewer will write back + tear down on next frame
         updateResourceTracking();
 
         if (!state_machine_.transitionTo(TrainingState::Stopping)) {

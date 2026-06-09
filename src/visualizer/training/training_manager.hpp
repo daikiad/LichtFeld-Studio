@@ -67,6 +67,16 @@ namespace lfs::vis {
         void stopTraining();
         void requestSaveCheckpoint();
 
+        // --- No-CUDA Vulkan training (macOS) ---
+        // Enable the Vulkan training path when the CUDA Trainer can't be built. Makes
+        // has_trainer true (so the Training panel + Start button activate) and stores params.
+        void setVkTrainable(const lfs::core::param::TrainingParameters& params);
+        [[nodiscard]] bool isVkTrainable() const { return vk_trainable_; }
+        [[nodiscard]] bool isVkActive() const { return vk_active_; }
+        [[nodiscard]] int vkTotalIterations() const { return vk_total_iters_; }
+        // Called by the viewer when the stepped Vulkan training finishes (or errors).
+        void finishVkTraining(bool success);
+
         // Temporary pause (for camera movement - doesn't change UI state)
         struct TemporaryPauseResult {
             bool synchronized = false;
@@ -183,6 +193,12 @@ namespace lfs::vis {
         VisualizerImpl* viewer_ = nullptr;
         core::Scene* scene_ = nullptr;
         std::optional<lfs::core::SplatExportableStorage> splat_storage_;
+
+        // No-CUDA Vulkan training state (the actual stepping lives in the viewer's render loop).
+        bool vk_trainable_ = false;
+        bool vk_active_ = false;
+        int vk_total_iters_ = 30000;
+        lfs::core::param::TrainingParameters vk_params_;
 
         // State machine (single source of truth for state)
         TrainingStateMachine state_machine_;

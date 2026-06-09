@@ -23,8 +23,15 @@
 #include "operator/ops/transform_ops.hpp"
 #include "python/python_runtime.hpp"
 #include "python/runner.hpp"
+#include "core/camera.hpp"
+#include "core/events.hpp"
+#include "core/scene.hpp"
 #include "rendering/coordinate_conventions.hpp"
+#include "rendering/rendering_manager.hpp"
+#include "rendering/split_view_service.hpp"
+#include "rendering/vksplat_viewport_renderer.hpp"
 #include "scene/scene_manager.hpp"
+#include "training/training_manager.hpp"
 #include "tools/align_tool.hpp"
 #include "tools/builtin_tools.hpp"
 #include "tools/selection_tool.hpp"
@@ -43,6 +50,15 @@
 namespace lfs::vis {
 
     using namespace lfs::core::events;
+
+    // Defined early so unique_ptr<VkTrainSession> is a complete type wherever ~VisualizerImpl
+    // (and other methods) instantiate its deleter.
+    struct VisualizerImpl::VkTrainSession {
+        VksplatViewportRenderer::VkTrainState state;
+        std::vector<lfs::rendering::ViewportRenderRequest> requests;
+        std::vector<std::vector<float>> gts;
+        bool built = false;
+    };
 
     namespace {
 
@@ -1247,6 +1263,135 @@ namespace lfs::vis {
         }
     }
 
+    bool VisualizerImpl::buildVkTrainSession(VkTrainSession& s) {
+        if (!scene_manager_ || !trainer_manager_)
+            return false;
+        auto& scene = scene_manager_->getScene();
+        auto* model = scene.getTrainingModel();
+        if (!model) {
+            LOG_ERROR("vk-train: scene has no training model");
+            return false;
+        }
+        const auto cameras = scene.getAllCameras();
+        const int sh_deg = model->get_max_sh_degree();
+        s.requests.clear();
+        s.gts.clear();
+        s.requests.reserve(cameras.size());
+        s.gts.reserve(cameras.size());
+        for (const auto& cam : cameras) {
+            if (!cam)
+                continue;
+            auto img = cam->load_and_get_image(-1, 0, /*output_uint8=*/true, /*update_dimensions=*/true).cpu();
+            const int W = cam->image_width();
+            const int H = cam->image_height();
+            if (W <= 0 || H <= 0 || !img.is_valid()) {
+                LOG_WARN("vk-train: skipping camera '{}' (no image)", cam->image_name());
+                continue;
+            }
+            const std::uint8_t* g = img.ptr<std::uint8_t>(); // CHW
+            std::vector<float> gt4(static_cast<std::size_t>(4) * H * W, 0.0f);
+            const std::size_t plane = static_cast<std::size_t>(H) * W;
+            for (std::size_t p = 0; p < plane; ++p) {
+                gt4[4 * p + 0] = g[0 * plane + p] / 255.0f;
+                gt4[4 * p + 1] = g[1 * plane + p] / 255.0f;
+                gt4[4 * p + 2] = g[2 * plane + p] / 255.0f;
+            }
+            auto rc = lfs::vis::detail::buildGTRenderCamera(*cam, glm::ivec2{W, H}, glm::mat4(1.0f));
+            if (!rc) {
+                LOG_WARN("vk-train: skipping camera '{}' (no render camera)", cam->image_name());
+                continue;
+            }
+            // Authoritative dataset world_view (transpose to column-major) composed with the
+            // loader's world flip F = diag(-1,1,-1,1) (negate rows 0,2). Mirrors vk_train.cpp.
+            auto wvt = cam->world_view_transform().squeeze(0).cpu().contiguous();
+            const float* wp = wvt.ptr<float>();
+            std::array<float, 16> wv{};
+            for (int r = 0; r < 4; ++r) {
+                const float sgn = (r == 0 || r == 2) ? -1.0f : 1.0f;
+                for (int c = 0; c < 4; ++c)
+                    wv[4 * r + c] = sgn * wp[4 * c + r];
+            }
+            lfs::rendering::ViewportRenderRequest req;
+            req.frame_view.size = glm::ivec2{W, H};
+            req.frame_view.world_view_override = wv;
+            req.frame_view.intrinsics_override = rc->intrinsics;
+            req.frame_view.background_color = glm::vec3(0.0f);
+            req.transparent_background = false;
+            req.equirectangular = rc->equirectangular;
+            req.sh_degree = sh_deg;
+            s.requests.push_back(std::move(req));
+            s.gts.push_back(std::move(gt4));
+        }
+        if (s.requests.empty()) {
+            LOG_ERROR("vk-train: no usable cameras with images");
+            return false;
+        }
+        s.state = VksplatViewportRenderer::VkTrainState{};
+        s.state.model = model;
+        s.state.requests = &s.requests;
+        s.state.gts = &s.gts;
+        s.state.total_iters = trainer_manager_->vkTotalIterations();
+        LOG_INFO("vk-train: session built with {} cameras, {} iters", s.requests.size(), s.state.total_iters);
+        return true;
+    }
+
+    void VisualizerImpl::driveVkTraining(VulkanContext* ctx) {
+        if (!trainer_manager_ || !rendering_manager_ || !ctx)
+            return;
+        auto* renderer = rendering_manager_->vksplatRenderer();
+        if (!renderer)
+            return;
+
+        if (!trainer_manager_->isVkActive()) {
+            // Stopped/finished: final device->host read-back so the viewport shows the result.
+            if (vk_session_ && vk_session_->built) {
+                renderer->vkTrainWriteBack(vk_session_->state);
+                rendering_manager_->markDirty(DirtyFlag::ALL);
+            }
+            vk_session_.reset();
+            return;
+        }
+        if (trainer_manager_->isPaused())
+            return;
+
+        if (!vk_session_)
+            vk_session_ = std::make_unique<VkTrainSession>();
+        if (!vk_session_->built) {
+            if (!buildVkTrainSession(*vk_session_)) {
+                trainer_manager_->finishVkTraining(false);
+                vk_session_.reset();
+                return;
+            }
+            vk_session_->built = true;
+        }
+
+        constexpr int kVkStepsPerFrame = 5;
+        auto exec = renderer->vkTrainStep(*ctx, vk_session_->state, kVkStepsPerFrame);
+        if (!exec) {
+            LOG_ERROR("vk-train step failed: {}", exec.error());
+            trainer_manager_->finishVkTraining(false);
+            vk_session_.reset();
+            return;
+        }
+        auto& st = vk_session_->state;
+        const int gaussians = st.model ? static_cast<int>(st.model->size()) : 0;
+        lfs::core::events::state::TrainingProgress{
+            .iteration = st.current_iter,
+            .loss = st.last_loss,
+            .num_gaussians = gaussians}
+            .emit();
+        // Periodic host read-back for the gaussian-count UI + eventual save; the viewport
+        // itself renders the device buffers directly so it stays live without this.
+        if (st.current_iter % 100 == 0)
+            renderer->vkTrainWriteBack(st);
+        if (st.current_iter >= st.total_iters) {
+            renderer->vkTrainWriteBack(st);
+            rendering_manager_->markDirty(DirtyFlag::ALL);
+            trainer_manager_->finishVkTraining(true);
+            vk_session_.reset();
+        }
+    }
+
     void VisualizerImpl::render() {
 
         auto now = std::chrono::high_resolution_clock::now();
@@ -1337,6 +1482,9 @@ namespace lfs::vis {
             gui_manager_->sequencerUI().tickPlaybackBeforeSceneRender();
 
         const bool is_training = trainer_manager_ && trainer_manager_->isRunning();
+        // No-CUDA Vulkan training: step a few iters per frame before the viewport renders, so
+        // the viewport presents the in-place-updated device buffers (live progress).
+        driveVkTraining(context.vulkan_context);
         const FrameDemand frame_demand = collectFrameDemand(viewport_export_locked, store_dirty);
         if (gui_frame_rendered_ && !frame_demand.shouldRenderFrame()) {
             LOG_PERF("loop_idle skip_gui_render=true needs_render={} continuous_input={} py_anim={} py_overlay={} py_redraw={} gui_anim={} input_event={} posted_work={} render_work={} store_dirty={}",

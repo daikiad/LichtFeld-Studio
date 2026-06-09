@@ -2118,23 +2118,20 @@ namespace lfs::vis {
             }
 
             if (scene_.hasTrainingData()) {
-                // The CUDA-coupled Trainer ctor throws when CUDA is unavailable (macOS/no-CUDA).
-                // Don't let that fail the whole load: catch it locally so the dataset still
-                // loads for viewing (cameras + point cloud render); training is simply
-                // unavailable until the no-CUDA Vulkan training path is wired behind the GUI.
-                try {
-                    auto trainer = std::make_unique<lfs::training::Trainer>(scene_);
-                    trainer->setParams(dataset_params);
-
-                    if (!services().trainerOrNull()) {
-                        return std::unexpected("No trainer manager");
+                if (auto* tm = services().trainerOrNull()) {
+                    tm->setScene(&scene_);
+                    // The CUDA-coupled Trainer ctor throws when CUDA is unavailable
+                    // (macOS/no-CUDA). Catch it locally so the dataset still loads, and
+                    // enable the no-CUDA Vulkan training path instead so the GUI can train.
+                    try {
+                        auto trainer = std::make_unique<lfs::training::Trainer>(scene_);
+                        trainer->setParams(dataset_params);
+                        tm->setTrainer(std::move(trainer));
+                    } catch (const std::exception& e) {
+                        LOG_WARN("CUDA Trainer unavailable ({}); enabling no-CUDA Vulkan training.",
+                                 e.what());
+                        tm->setVkTrainable(dataset_params);
                     }
-                    services().trainerOrNull()->setScene(&scene_);
-                    services().trainerOrNull()->setTrainer(std::move(trainer));
-                } catch (const std::exception& e) {
-                    LOG_WARN("Trainer unavailable ({}); dataset loaded for viewing only "
-                             "(training disabled).",
-                             e.what());
                 }
             }
 
