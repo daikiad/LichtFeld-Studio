@@ -4,6 +4,7 @@
 
 #include "gui/panel_registry.hpp"
 #include "core/logger.hpp"
+#include "core/process_singleton.hpp"
 #include "gui/gui_focus_state.hpp"
 #include "gui/panel_layout.hpp"
 #include "gui/ui_context.hpp"
@@ -178,8 +179,15 @@ namespace lfs::vis::gui {
     }
 
     PanelRegistry& PanelRegistry::instance() {
-        static PanelRegistry registry;
-        return registry;
+        // lfs_visualizer is static on macOS, so it's baked into both the executable and the
+        // lichtfeld Python extension. Python lf.register_class registers panels into the
+        // extension's copy while the GUI's panel_layout reads the executable's copy — so the
+        // Training/Rendering/etc. tabs never appeared. Collapse to one instance via the shared
+        // lfs_core slot (same fix as the operator registry).
+        static PanelRegistry local;
+        static auto* shared = static_cast<PanelRegistry*>(
+            lfs::core::process_singleton_get_or_set("lfs.gui.panel_registry", &local));
+        return *shared;
     }
 
     uint64_t PanelRegistry::alloc_float_stack_order_locked() {
