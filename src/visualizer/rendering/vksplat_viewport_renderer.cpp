@@ -3969,8 +3969,14 @@ namespace lfs::vis {
         st.grad_count.assign(buffers_.num_splats, 0);
         st.adam_t = 1;
         st.current_iter = 0;
+        // Densify only through the first half of training (like 3DGS' grow_until), capped at
+        // 15000 iters. Otherwise a long run keeps cloning every refine_every step and the splat
+        // count compounds toward max_cap, making each step crawl.
         if (st.stop_refine <= 0)
-            st.stop_refine = std::max(st.start_refine, st.total_iters - 50);
+            st.stop_refine = std::clamp(st.total_iters / 2, st.start_refine, 15000);
+        // Bound total growth relative to the initial cloud so it can't explode on long runs.
+        // ~6x initial is plenty for object-scale scenes; the absolute ceiling still applies.
+        st.max_cap = std::min<std::size_t>(st.max_cap, static_cast<std::size_t>(buffers_.num_splats) * 6);
         st.primed = true;
 
         const float l1 = vkTrainOutputL1(context, st, 0);
