@@ -3876,6 +3876,109 @@ namespace lfs::vis {
 
         LOG_WARN("vk-train: {} cameras, {} splats, {} iters", n_cams, buffers_.num_splats, iters);
 
+        // --- Densification (gradient-driven clone + opacity prune) ---
+        // Pull the optimizer-updated device params back into the model's host tensors.
+        const auto syncDeviceToModel = [&]() {
+            const auto wb = [&](const _VulkanBuffer& dev, lfs::core::Tensor& t) {
+                renderer_.downloadDeviceBufferToHost(dev, t.ptr<float>(),
+                                                     static_cast<std::size_t>(t.numel()) * sizeof(float));
+            };
+            wb(buffers_.xyz_ws.deviceBuffer, model.means_raw());
+            wb(buffers_.sh0.deviceBuffer, model.sh0());
+            wb(buffers_.shN.deviceBuffer, model.shN());
+            wb(buffers_.rotations.deviceBuffer, model.rotation_raw());
+            wb(buffers_.scaling_raw.deviceBuffer, model.scaling_raw());
+            wb(buffers_.opacity_raw.deviceBuffer, model.opacity_raw());
+        };
+
+        std::vector<double> grad_accum(buffers_.num_splats, 0.0);
+        std::vector<int> grad_count(buffers_.num_splats, 0);
+        std::vector<float> vxy_host;
+        std::vector<std::int32_t> radii_host;
+        std::uint32_t adam_t = 1;
+        const int refine_every = 100;
+        const int start_refine = 500;
+        const int stop_refine = std::max(start_refine, iters - 50);
+        const std::size_t max_cap = 3'000'000;
+        const float min_opacity = 0.005f;
+        const float grow_fraction = 0.05f;
+
+        // One densify pass: clone top-gradient splats, prune low-opacity, mutate the model
+        // in host/canonical space, then re-prime the device buffers from the new model.
+        const auto densify = [&](int step) {
+            syncDeviceToModel();
+            const std::size_t N = static_cast<std::size_t>(model.size());
+            if (N == 0)
+                return;
+            auto op_cpu = model.opacity_raw().cpu().contiguous();
+            const float* opp = op_cpu.ptr<float>();
+            std::vector<std::int32_t> keep;
+            keep.reserve(N);
+            std::vector<std::pair<float, std::int32_t>> cand;
+            for (std::size_t i = 0; i < N; ++i) {
+                const float opac = 1.0f / (1.0f + std::exp(-opp[i]));
+                if (opac <= min_opacity)
+                    continue;
+                keep.push_back(static_cast<std::int32_t>(i));
+                if (i < grad_count.size() && grad_count[i] > 0)
+                    cand.push_back({static_cast<float>(grad_accum[i] / grad_count[i]), static_cast<std::int32_t>(i)});
+            }
+            if (keep.empty())
+                return;
+            std::size_t want = static_cast<std::size_t>(grow_fraction * static_cast<float>(keep.size()));
+            if (keep.size() + want > max_cap)
+                want = max_cap > keep.size() ? max_cap - keep.size() : 0;
+            std::vector<std::int32_t> clone;
+            if (want > 0 && !cand.empty()) {
+                const std::size_t k = std::min(want, cand.size());
+                std::partial_sort(cand.begin(), cand.begin() + k, cand.end(),
+                                  [](const auto& a, const auto& b) { return a.first > b.first; });
+                for (std::size_t c = 0; c < k; ++c)
+                    clone.push_back(cand[c].second);
+            }
+            const std::size_t new_N = keep.size() + clone.size();
+            // Plain-C++ row gather+clone (avoids index_select/cat device dispatch on host-CUDA tensors).
+            const auto gatherClone = [&](const lfs::core::Tensor& src) -> lfs::core::Tensor {
+                auto s = src.cpu().contiguous();
+                const float* sp = s.ptr<float>();
+                const std::size_t n_old = static_cast<std::size_t>(src.shape()[0]);
+                const std::size_t row = n_old ? static_cast<std::size_t>(src.numel()) / n_old : 0;
+                std::vector<std::size_t> shp;
+                for (std::size_t d = 0; d < src.shape().rank(); ++d)
+                    shp.push_back(static_cast<std::size_t>(src.shape()[d]));
+                shp[0] = new_N;
+                lfs::core::Tensor out = lfs::core::Tensor::empty(
+                    lfs::core::TensorShape(shp), lfs::core::Device::CPU, lfs::core::DataType::Float32);
+                float* dp = out.ptr<float>();
+                std::size_t j = 0;
+                for (std::int32_t i : keep) {
+                    std::memcpy(dp + j * row, sp + static_cast<std::size_t>(i) * row, row * sizeof(float));
+                    ++j;
+                }
+                for (std::int32_t i : clone) {
+                    std::memcpy(dp + j * row, sp + static_cast<std::size_t>(i) * row, row * sizeof(float));
+                    ++j;
+                }
+                return out.to(src.device());
+            };
+            model.means_raw() = gatherClone(model.means_raw());
+            model.sh0() = gatherClone(model.sh0());
+            model.rotation_raw() = gatherClone(model.rotation_raw());
+            model.scaling_raw() = gatherClone(model.scaling_raw());
+            model.opacity_raw() = gatherClone(model.opacity_raw());
+            auto canon = model.shN_canonical_cpu();
+            if (canon.is_valid() && canon.numel() > 0) {
+                auto new_canon = gatherClone(canon);
+                model.shN_set_from_canonical(new_canon, new_N);
+            }
+            grad_accum.assign(new_N, 0.0);
+            grad_count.assign(new_N, 0);
+            for (int w = 0; w < static_cast<int>(kInputRingSize) + 1; ++w)
+                (void)render(context, model, requests[0], /*force_input_upload=*/true, OutputSlot::Main, false);
+            LOG_WARN("vk-train densify @step {:4d}: {} -> {} splats (kept {}, cloned {})",
+                     step, N, new_N, keep.size(), clone.size());
+        };
+
         for (int step = 1; step <= iters; ++step) {
             const std::size_t cam = static_cast<std::size_t>(step - 1) % n_cams;
             auto r = render(context, model, requests[cam], /*force_input_upload=*/false,
@@ -3904,7 +4007,7 @@ namespace lfs::vis {
             lu.inv_scale = 1.0f / static_cast<float>(3 * P);
 
             FusedSplitOptimizerUniforms ou{};
-            ou.step = static_cast<std::uint32_t>(step);
+            ou.step = adam_t; // resets to 1 after densification to re-clear Adam moments at the new N
             ou.active_sh = last_uniforms_.active_sh | (last_uniforms_.camera_model << 8);
             ou.num_splats = static_cast<std::uint32_t>(buffers_.num_splats);
             ou.image_size = (static_cast<std::uint32_t>(H) << 16) | static_cast<std::uint32_t>(W);
@@ -3929,24 +4032,42 @@ namespace lfs::vis {
             renderer_.executeL1LossGradient(lu, buffers_);
             renderer_.executeRasterizeBackward(last_uniforms_, buffers_);
             renderer_.executeFusedProjectionBackwardOptimizerSplit(ou, buffers_);
+            ++adam_t;
+
+            // Accumulate the per-gaussian screen-space gradient magnitude (densification stat).
+            {
+                const std::size_t Ns = buffers_.num_splats;
+                if (grad_accum.size() != Ns) {
+                    grad_accum.assign(Ns, 0.0);
+                    grad_count.assign(Ns, 0);
+                }
+                vxy_host.resize(2 * Ns);
+                radii_host.resize(Ns);
+                renderer_.downloadDeviceBufferToHost(buffers_.v_xy_vs.deviceBuffer, vxy_host.data(),
+                                                     2 * Ns * sizeof(float));
+                renderer_.downloadDeviceBufferToHost(buffers_.radii.deviceBuffer, radii_host.data(),
+                                                     Ns * sizeof(std::int32_t));
+                for (std::size_t i = 0; i < Ns; ++i) {
+                    if (radii_host[i] > 0) {
+                        grad_accum[i] += std::hypot(vxy_host[2 * i], vxy_host[2 * i + 1]);
+                        grad_count[i] += 1;
+                    }
+                }
+            }
 
             if (cam == 0 || step == iters) { // cam 0 each cycle => comparable convergence signal
                 log_l1(cam, step);
             }
+
+            if (step >= start_refine && step <= stop_refine && (step % refine_every) == 0) {
+                densify(step);
+                adam_t = 1; // re-clear Adam moments at the new splat count on the next optimizer step
+            }
         }
 
-        // Read the optimizer-updated raw params out of the owned device buffers back into
-        // the model so it can be saved (the host-copy input path does NOT alias them).
-        const auto write_back = [&](const _VulkanBuffer& dev, lfs::core::Tensor& t) {
-            renderer_.downloadDeviceBufferToHost(dev, t.ptr<float>(),
-                                                 static_cast<std::size_t>(t.numel()) * sizeof(float));
-        };
-        write_back(buffers_.xyz_ws.deviceBuffer, model.means_raw());
-        write_back(buffers_.sh0.deviceBuffer, model.sh0());
-        write_back(buffers_.shN.deviceBuffer, model.shN());
-        write_back(buffers_.rotations.deviceBuffer, model.rotation_raw());
-        write_back(buffers_.scaling_raw.deviceBuffer, model.scaling_raw());
-        write_back(buffers_.opacity_raw.deviceBuffer, model.opacity_raw());
+        // Read the final optimizer-updated raw params out of the owned device buffers back
+        // into the model so it can be saved (the host-copy input path does NOT alias them).
+        syncDeviceToModel();
         return {};
     }
 
