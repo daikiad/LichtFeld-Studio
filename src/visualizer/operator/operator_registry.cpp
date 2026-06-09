@@ -464,7 +464,8 @@ namespace lfs::vis::op {
 
         const auto it = python_operators_.find(class_id);
         if (it == python_operators_.end()) {
-            LOG_WARN("Operator not found: {}", class_id);
+            LOG_WARN("Operator not found: {} (registered python operators: {})",
+                     class_id, python_operators_.size());
             return OperatorReturnValue::cancelled();
         }
 

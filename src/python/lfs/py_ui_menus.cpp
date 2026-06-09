@@ -7,6 +7,7 @@
 #include "gui/rml_menu_bar.hpp"
 #include "operator/operator_registry.hpp"
 #include "py_ui.hpp"
+#include "python/runner.hpp"
 
 #include <algorithm>
 #include <mutex>
@@ -497,7 +498,13 @@ namespace lfs::python {
     }
 
     void PyMenuRegistry::sync_from_python() const {
-        // GIL is already held by callers (bridge functions in python_runtime.cpp)
+        // GIL is already held by callers (bridge functions in python_runtime.cpp).
+        // Ensure the builtin panels/operators are registered BEFORE we build menu items:
+        // builtin-UI registration is deferred at startup, and a menu item carries only an
+        // operator_id string, so without this the first menu draw can reference operators
+        // that aren't in the registry yet → intermittent "Operator not found" on click.
+        // Idempotent + cheap after the first call.
+        ensure_builtin_ui_registered();
         try {
             auto menus_module = nb::module_::import_("lfs_plugins.layouts.menus");
             auto get_menu_classes = menus_module.attr("get_menu_classes");
