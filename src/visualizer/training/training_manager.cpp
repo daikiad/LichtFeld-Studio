@@ -191,6 +191,11 @@ namespace lfs::vis {
                               ? static_cast<int>(params.optimization.iterations)
                               : 30000;
         updateResourceTracking();
+        // Move Idle -> Ready so canStart() passes (mirrors the CUDA setTrainer path), otherwise
+        // Start is blocked with "No dataset loaded".
+        if (!state_machine_.transitionTo(TrainingState::Ready)) {
+            LOG_WARN("Failed to transition to Ready (vk)");
+        }
         // Drive the same "trainer ready" UI path as the CUDA setTrainer: enables the Training
         // panel + Start button (store.trainer_loaded) and focuses the panel. The handlers are
         // null-trainer-safe.

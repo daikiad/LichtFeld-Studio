@@ -74,6 +74,7 @@ namespace lfs::vis {
         [[nodiscard]] bool isVkTrainable() const { return vk_trainable_; }
         [[nodiscard]] bool isVkActive() const { return vk_active_; }
         [[nodiscard]] int vkTotalIterations() const { return vk_total_iters_; }
+        [[nodiscard]] const lfs::core::param::TrainingParameters& vkParams() const { return vk_params_; }
         // Called by the viewer when the stepped Vulkan training finishes (or errors).
         void finishVkTraining(bool success);
 

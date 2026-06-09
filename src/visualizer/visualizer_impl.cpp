@@ -32,6 +32,7 @@
 #include "rendering/vksplat_viewport_renderer.hpp"
 #include "scene/scene_manager.hpp"
 #include "training/training_manager.hpp"
+#include "training/training_setup.hpp"
 #include "tools/align_tool.hpp"
 #include "tools/builtin_tools.hpp"
 #include "tools/selection_tool.hpp"
@@ -1269,7 +1270,18 @@ namespace lfs::vis {
         auto& scene = scene_manager_->getScene();
         auto* model = scene.getTrainingModel();
         if (!model) {
-            LOG_ERROR("vk-train: scene has no training model");
+            // Dataset imported as a point cloud only (no init splat). Build the trainable
+            // SplatData from the point cloud now, like the CUDA startTraining path does.
+            if (auto r = lfs::training::initializeTrainingModel(
+                    trainer_manager_->vkParams(), scene, lfs::core::SplatTensorAllocator{});
+                !r) {
+                LOG_ERROR("vk-train: initializeTrainingModel failed: {}", r.error());
+                return false;
+            }
+            model = scene.getTrainingModel();
+        }
+        if (!model) {
+            LOG_ERROR("vk-train: scene has no training model after init");
             return false;
         }
         const auto cameras = scene.getAllCameras();
