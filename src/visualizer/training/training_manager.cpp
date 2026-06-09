@@ -191,6 +191,10 @@ namespace lfs::vis {
                               ? static_cast<int>(params.optimization.iterations)
                               : 30000;
         updateResourceTracking();
+        // Drive the same "trainer ready" UI path as the CUDA setTrainer: enables the Training
+        // panel + Start button (store.trainer_loaded) and focuses the panel. The handlers are
+        // null-trainer-safe.
+        internal::TrainerReady{}.emit();
         LOG_INFO("No-CUDA Vulkan training enabled ({} iterations planned)", vk_total_iters_);
     }
 
