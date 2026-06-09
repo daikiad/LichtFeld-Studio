@@ -3,6 +3,8 @@
 
 #include "visualizer/app_store.hpp"
 
+#include "core/process_singleton.hpp"
+
 namespace lfs::vis {
 
     AppStore::AppStore()
@@ -50,8 +52,15 @@ namespace lfs::vis {
           viewport_toolbar_generation(store_, Field::ViewportToolbarGeneration, "viewport_toolbar_generation", 0) {}
 
     AppStore& app_store() {
-        static AppStore instance;
-        return instance;
+        // lfs_visualizer is static on macOS, so it's baked into both the executable and the
+        // lichtfeld Python extension. A plain Meyers singleton here gave each its own store:
+        // C++ handlers wrote the executable's copy while the Python StateSignal bridge read the
+        // extension's copy, so reactive UI values (training iteration, etc.) never updated.
+        // Collapse to one instance via the shared lfs_core slot (same fix as the registries).
+        static AppStore local;
+        static auto* shared = static_cast<AppStore*>(
+            lfs::core::process_singleton_get_or_set("lfs.vis.app_store", &local));
+        return *shared;
     }
 
     void publish_language_generation() {
