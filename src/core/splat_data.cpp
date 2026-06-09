@@ -1208,7 +1208,16 @@ namespace lfs::core {
                 LOG_DEBUG("  Converting pcd.colors (dtype={}) to float32...",
                           pcd.colors.dtype() == DataType::UInt8 ? "UInt8" : "Float32");
                 if (pcd.colors.dtype() == DataType::UInt8) {
-                    colors = pcd.colors.to(DataType::Float32).div(255.0f).cuda();
+                    // Normalize uint8 [0,255] -> float [0,1]. The lazy/fused scalar-op path
+                    // (Tensor::div(scalar)) miscomputes on the no-CUDA build (yields zeros),
+                    // collapsing every init color to black. Do the /255 with a plain host loop
+                    // on a CPU float copy instead, then move to the compute device.
+                    auto cf = pcd.colors.to(DataType::Float32).cpu().contiguous();
+                    float* cfp = cf.ptr<float>();
+                    const std::int64_t cn = cf.numel();
+                    for (std::int64_t i = 0; i < cn; ++i)
+                        cfp[i] *= (1.0f / 255.0f);
+                    colors = cf.to(positions.device());
                 } else {
                     colors = pcd.colors.to(DataType::Float32).cuda();
                 }
