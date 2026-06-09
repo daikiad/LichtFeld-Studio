@@ -389,7 +389,8 @@ namespace lfs::rendering {
                 world_to_camera[3][row] = translation[row];
             }
 
-            return scene_transform * glm::inverse(world_to_camera) * DATA_TO_VISUALIZER_CAMERA_AXES_4;
+            return scene_transform * DATASET_CAMERA_GIZMO_WORLD_FLIP_4 *
+                   glm::inverse(world_to_camera) * DATA_TO_VISUALIZER_CAMERA_AXES_4;
         }
 
         [[nodiscard]] std::vector<glm::vec3> cameraFrustumWorldPoints(

@@ -46,6 +46,15 @@ namespace lfs::rendering {
     inline const glm::mat3 VISUALIZER_TO_DATA_WORLD_AXES = DATA_TO_VISUALIZER_WORLD_AXES;
     inline const glm::mat4 DATA_TO_VISUALIZER_WORLD_AXES_4 = DATA_TO_VISUALIZER_CAMERA_AXES_4;
     inline const glm::mat4 VISUALIZER_TO_DATA_WORLD_AXES_4 = DATA_TO_VISUALIZER_WORLD_AXES_4;
+    // The NeRF/Blender loader leaves dataset cameras diag(-1,1,-1) reflected relative to the
+    // (correct) point-cloud means; the no-CUDA trainer reconciles this via F=diag(-1,1,-1,1) in
+    // the view matrix. The camera frustum gizmos don't go through F, so apply the same
+    // world-basis flip (left of inverse(w2c)) when building the gizmo camera-to-world, otherwise
+    // the gizmos sit at the reflected position instead of around the splats.
+    inline const glm::mat4 DATASET_CAMERA_GIZMO_WORLD_FLIP_4{-1, 0, 0, 0,
+                                                             0, 1, 0, 0,
+                                                             0, 0, -1, 0,
+                                                             0, 0, 0, 1};
     inline const glm::mat3 VISUALIZER_TO_RASTER_CAMERA_AXES{1, 0, 0, 0, 1, 0, 0, 0, -1};
     inline const glm::mat3 RASTER_TO_VISUALIZER_CAMERA_AXES = VISUALIZER_TO_RASTER_CAMERA_AXES;
 

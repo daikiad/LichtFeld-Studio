@@ -1762,7 +1762,8 @@ namespace lfs::vis::gui {
                 world_to_camera[3][row] = translation[row];
             }
 
-            return scene_transform * glm::inverse(world_to_camera) *
+            return scene_transform * lfs::rendering::DATASET_CAMERA_GIZMO_WORLD_FLIP_4 *
+                   glm::inverse(world_to_camera) *
                    lfs::rendering::DATA_TO_VISUALIZER_CAMERA_AXES_4;
         }
 

@@ -1572,7 +1572,8 @@ namespace lfs::vis {
             }
 
             const glm::mat4 visualizer_c2w =
-                cam_scene_transform * glm::inverse(w2c) * rendering::DATA_TO_VISUALIZER_CAMERA_AXES_4;
+                cam_scene_transform * rendering::DATASET_CAMERA_GIZMO_WORLD_FLIP_4 *
+                glm::inverse(w2c) * rendering::DATA_TO_VISUALIZER_CAMERA_AXES_4;
             const glm::vec3 cam_pos = glm::vec3(visualizer_c2w[3]);
 
             const bool is_equirect =
